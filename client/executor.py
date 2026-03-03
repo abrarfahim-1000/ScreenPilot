@@ -20,10 +20,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pyautogui
+from redaction import redact_text
 
 # pyautogui safety: disable the fail-safe corner but keep a short pause between actions
 pyautogui.FAILSAFE = True       # move mouse to top-left corner to abort
-pyautogui.PAUSE = 0.05          # 50 ms between every pyautogui call
+pyautogui.PAUSE = 0.10          # 100 ms between every pyautogui call (was 50ms; more reliable on slow VMs)
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +114,28 @@ class ActionExecutor:
             wins = gw.getWindowsWithTitle(title)
             if not wins:
                 return ExecutionResult("FOCUS_WINDOW", False, f"No window found matching '{title}'")
-            wins[0].activate()
-            time.sleep(0.3)
-            return ExecutionResult("FOCUS_WINDOW", True, f"Focused '{wins[0].title}'")
+            win = wins[0]
+            # Use ctypes on Windows for reliable foreground activation.
+            # pygetwindow's .activate() is often ignored by the OS when another
+            # app has the lock; SetForegroundWindow + ShowWindow bypass that.
+            try:
+                import ctypes
+                hwnd = win._hWnd          # Win32Window exposes _hWnd
+                ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                win.activate()            # fallback for non-Windows / missing _hWnd
+            time.sleep(0.6)               # give window time to receive keyboard focus
+            return ExecutionResult("FOCUS_WINDOW", True, f"Focused '{win.title}'")
         except Exception as exc:  # noqa: BLE001
             return ExecutionResult("FOCUS_WINDOW", False, f"Could not focus window: {exc}")
 
     def _click(self, action: dict) -> ExecutionResult:
         x, y = action.get("x", 0), action.get("y", 0)
         pyautogui.click(x, y)
+        # Extra settle time: taskbar/app-launcher clicks need the OS to bring
+        # the new window to the foreground before keyboard events can land in it.
+        time.sleep(0.25)
         return ExecutionResult("CLICK", True, f"Clicked ({x}, {y})")
 
     def _double_click(self, action: dict) -> ExecutionResult:
@@ -138,15 +152,39 @@ class ActionExecutor:
         text = action.get("text", "")
         if not text:
             return ExecutionResult("TYPE", False, "Empty text — skipped")
-        # pyautogui.typewrite doesn't handle unicode well; use pyperclip + paste
+
+        # ── Secret redaction (Day 1 safety requirement) ────────────────
+        # Scan the text BEFORE it is executed or leaves the client.
+        # If secrets are found, replace them with placeholders and block
+        # the action so raw credentials are never typed or copied.
+        safe_text, matches = redact_text(text)
+        if matches:
+            names = [m.pattern_name for m in matches]
+            logger.warning(
+                "TYPE action blocked: %d secret(s) detected and redacted: %s",
+                len(matches),
+                names,
+            )
+            return ExecutionResult(
+                "TYPE",
+                False,
+                f"Blocked — {len(matches)} secret(s) redacted "
+                f"({', '.join(names)}). Secrets never leave the client unredacted.",
+            )
+
+        # ── Execute (clean text only) ──────────────────────────────────
+        # pyautogui.typewrite doesn't handle unicode well; use pyperclip + paste.
+        # IMPORTANT: sleep after copy so the OS clipboard is populated before
+        # ctrl+v fires — without this there is a race on fast machines.
         try:
             import pyperclip
-            pyperclip.copy(text)
+            pyperclip.copy(safe_text)
+            time.sleep(0.15)              # wait for clipboard to settle
             pyautogui.hotkey("ctrl", "v")
-            return ExecutionResult("TYPE", True, f"Typed {len(text)} chars via clipboard")
+            return ExecutionResult("TYPE", True, f"Typed {len(safe_text)} chars via clipboard")
         except Exception:
-            pyautogui.typewrite(text, interval=0.03)
-            return ExecutionResult("TYPE", True, f"Typed {len(text)} chars via typewrite")
+            pyautogui.typewrite(safe_text, interval=0.04)
+            return ExecutionResult("TYPE", True, f"Typed {len(safe_text)} chars via typewrite")
 
     def _hotkey(self, action: dict) -> ExecutionResult:
         keys = action.get("keys", [])

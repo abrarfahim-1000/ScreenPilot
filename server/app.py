@@ -28,6 +28,8 @@ from typing import Annotated
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 
+import re as _re
+
 from gemini import GeminiPerceptionClient
 from schemas import (
     ActionExpected,
@@ -53,7 +55,7 @@ async def lifespan(app: FastAPI):
     if startup_key:
         _gemini_client = GeminiPerceptionClient(
             api_key=startup_key,
-            model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+            model=os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview"),
         )
         logger.info("GeminiPerceptionClient initialised (model=%s)", _gemini_client.model)
     else:
@@ -81,82 +83,151 @@ def _build_action_response(
     metadata: FrameMetadata,
     perception,
     raw_model_output: str,
+    planned_actions: list[dict] | None = None,
 ) -> ActionResponse:
     """
-    Translate a PerceptionOutput into an executable ActionResponse.
+    Translate a PerceptionOutput and a planned action list into an
+    executable ActionResponse.
 
-    Current strategy (Day 1–2 skeleton):
-    - If an unexpected modal is detected → ABORT and hand off to user.
-    - Otherwise → issue a WAIT + VERIFY so the client re-captures and sends
-      a fresh frame, giving the full planning loop a chance to run on stable
-      state.  (Real planning / action selection lives in `planner.py` — Day 6.)
+    Priority
+    --------
+    1. Unexpected modal → always HAND_OFF_TO_USER regardless of plan.
+    2. Perception failed → HAND_OFF_TO_USER.
+    3. planned_actions provided by the Gemini planner → use them directly.
+    4. Fallback (no planner result) → WAIT + VERIFY skeleton.
     """
-    actions: list = []
-
     if perception.unexpected_modal:
-        # Unexpected dialog present — hand off immediately
         logger.warning(
             "Unexpected modal detected (session=%s step=%d): %s",
             metadata.session_id,
             metadata.step_id,
             perception.unexpected_modal,
         )
-        actions.append(
-            HandOffAction(
-                summary=(
-                    f"Unexpected modal/dialog detected: {perception.unexpected_modal}. "
-                    "Human action required."
-                ),
-                reason="Modal pre-check triggered",
-            )
+        return ActionResponse(
+            session_id=metadata.session_id,
+            step_id=metadata.step_id,
+            perception=perception,
+            actions=[
+                HandOffAction(
+                    summary=(
+                        f"Unexpected modal/dialog detected: {perception.unexpected_modal}. "
+                        "Human action required."
+                    ),
+                    reason="Modal pre-check triggered",
+                ).model_dump()
+            ],
+            expected=ActionExpected(
+                must_see=[],
+                timeout_ms=0,
+                max_retries=0,
+                on_failure=OnFailure.HAND_OFF_TO_USER,
+            ),
+            raw_model_output=raw_model_output,
         )
-        expected = ActionExpected(
-            must_see=[],
-            timeout_ms=0,
-            max_retries=0,
-            on_failure=OnFailure.HAND_OFF_TO_USER,
+
+    if not perception.elements and "unavailable" in perception.screen_summary:
+        return ActionResponse(
+            session_id=metadata.session_id,
+            step_id=metadata.step_id,
+            perception=perception,
+            actions=[
+                HandOffAction(
+                    summary=perception.screen_summary,
+                    reason="Perception unavailable — cannot plan actions",
+                ).model_dump()
+            ],
+            expected=ActionExpected(
+                must_see=[],
+                timeout_ms=0,
+                max_retries=0,
+                on_failure=OnFailure.HAND_OFF_TO_USER,
+            ),
+            raw_model_output=raw_model_output,
         )
-    elif not perception.elements and "unavailable" in perception.screen_summary:
-        # Perception failed (fallback response from GeminiPerceptionClient)
-        actions.append(
-            HandOffAction(
-                summary=perception.screen_summary,
-                reason="Perception unavailable — cannot plan actions",
-            )
-        )
-        expected = ActionExpected(
-            must_see=[],
-            timeout_ms=0,
-            max_retries=0,
-            on_failure=OnFailure.HAND_OFF_TO_USER,
-        )
+
+    if planned_actions:
+        actions_out = planned_actions
     else:
-        # Nominal path: brief wait then a visual verification re-capture
-        actions.append(
-            WaitAction(ms=500, reason="Allow UI to settle before next observation")
-        )
-        actions.append(
+        # Fallback: no planner result — re-observe on next cycle
+        actions_out = [
+            WaitAction(ms=500, reason="Allow UI to settle before next observation").model_dump(),
             VerifyAction(
                 method="visual",
                 description=f"Visual precision check: confirm expected state after step {metadata.step_id}",
                 reason="Mandatory VERIFY after every major step",
-            )
-        )
-        expected = ActionExpected(
-            must_see=[],
-            timeout_ms=15000,
-            max_retries=3,
-            on_failure=OnFailure.HAND_OFF_TO_USER,
-        )
+            ).model_dump(),
+        ]
 
     return ActionResponse(
         session_id=metadata.session_id,
         step_id=metadata.step_id,
         perception=perception,
-        actions=[a.model_dump() for a in actions],
-        expected=expected,
+        actions=actions_out,
+        expected=ActionExpected(
+            must_see=[],
+            timeout_ms=15000,
+            max_retries=3,
+            on_failure=OnFailure.HAND_OFF_TO_USER,
+        ),
         raw_model_output=raw_model_output,
     )
+
+_URL_PATTERN = _re.compile(r'https?://[^\s\'"]+', _re.IGNORECASE)
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Return all HTTP/HTTPS URLs found in *text*."""
+    return _URL_PATTERN.findall(text)
+
+
+def _actions_already_navigate(actions: list[dict], url: str) -> bool:
+    """Return True if the action list already types *url* into a browser."""
+    url_bare = url.rstrip('\n').rstrip('/')
+    for a in actions:
+        if a.get('type') == 'TYPE':
+            typed = a.get('text', '').rstrip('\n').rstrip('/')
+            if typed.lower() == url_bare.lower():
+                return True
+    return False
+
+
+def _inject_browser_navigation(actions: list[dict], url: str) -> list[dict]:
+    """
+    Prepend a guaranteed browser-navigation sequence before the model's actions
+    when the model failed to include one itself.
+
+    Sequence injected:
+        FOCUS_WINDOW(Chrome) → WAIT(800) → HOTKEY(ctrl+l) → WAIT(300)
+        → TYPE(url\n) → WAIT(1500) → <remaining model actions>
+    The trailing VERIFY from the model is preserved at the end.
+    """
+    nav = [
+        {"type": "FOCUS_WINDOW", "title_contains": "Chrome",
+         "reason": "Bring Chrome to foreground before navigation [injected]"},
+        {"type": "WAIT", "ms": 800,
+         "reason": "Wait for Chrome to receive keyboard focus [injected]"},
+        {"type": "HOTKEY", "keys": ["ctrl", "l"],
+         "reason": "Focus address bar [injected]"},
+        {"type": "WAIT", "ms": 300,
+         "reason": "Wait for address bar to be active [injected]"},
+        {"type": "TYPE", "text": url.rstrip('\n') + '\n',
+         "reason": f"Navigate to {url} [injected]"},
+        {"type": "WAIT", "ms": 1500,
+         "reason": "Wait for page to load [injected]"},
+    ]
+    # Keep any non-TYPE/HOTKEY/WAIT/FOCUS actions the model generated,
+    # and always keep the trailing VERIFY.
+    passthrough_types = {"VERIFY", "CLICK", "SCROLL", "HAND_OFF_TO_USER", "ABORT"}
+    remainder = [a for a in actions if a.get('type') in passthrough_types]
+    # Guarantee VERIFY at the end
+    if not remainder or remainder[-1].get('type') != 'VERIFY':
+        remainder.append({
+            "type": "VERIFY", "method": "visual",
+            "description": f"Visual precision check: confirm {url} loaded",
+            "reason": "Mandatory VERIFY [injected]",
+        })
+    return nav + remainder
+
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 async def health_check() -> HealthResponse:
@@ -185,7 +256,6 @@ async def process_frame(
     Returns an ``ActionResponse`` containing the perception result and an
     ordered list of actions the client should execute.
     """
-    # ── Validate metadata ────────────────────────────────────────────────
     try:
         meta_dict = json.loads(metadata)
         frame_meta = FrameMetadata.model_validate(meta_dict)
@@ -195,7 +265,6 @@ async def process_frame(
             detail=f"Invalid metadata JSON: {exc}",
         ) from exc
 
-    # ── Read JPEG bytes ─────────────────────────────────────────────────
     jpeg_bytes = await frame.read()
     if not jpeg_bytes:
         raise HTTPException(
@@ -224,7 +293,7 @@ async def process_frame(
     if override_key:
         active_client = GeminiPerceptionClient(
             api_key=override_key,
-            model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-pro"),
         )
         logger.info("Using per-request API key (session=%s)", frame_meta.session_id)
     elif _gemini_client is not None:
@@ -242,8 +311,43 @@ async def process_frame(
         task_goal=frame_meta.task_goal,
     )
 
+    # ── Planning: ask Gemini for a concrete action list ─────────────────────
+    # Skip if perception failed or modal detected (handled downstream).
+    planned_actions: list[dict] | None = None
+    perception_ok = (
+        perception.unexpected_modal is None
+        and not (not perception.elements and "unavailable" in perception.screen_summary)
+    )
+    if perception_ok and frame_meta.task_goal.strip():
+        planned_actions, plan_raw = active_client.plan(
+            perception=perception,
+            session_id=frame_meta.session_id,
+            step_id=frame_meta.step_id,
+            task_goal=frame_meta.task_goal,
+        )
+        logger.info(
+            "Planner returned %d action(s) for session=%s step=%d",
+            len(planned_actions),
+            frame_meta.session_id,
+            frame_meta.step_id,
+        )
+
+        # ── Navigation injection guard ─────────────────────────────────
+        # If the task contains a URL but the model did not emit a proper
+        # navigation sequence, inject one unconditionally so the browser
+        # always ends up at the right address regardless of model behaviour.
+        urls_in_goal = _extract_urls(frame_meta.task_goal)
+        if urls_in_goal:
+            target_url = urls_in_goal[0]
+            if not _actions_already_navigate(planned_actions, target_url):
+                logger.info(
+                    "Navigation injection: model missed URL %s — prepending sequence",
+                    target_url,
+                )
+                planned_actions = _inject_browser_navigation(planned_actions, target_url)
+
     # ── Build and return action response ────────────────────────────────
-    response = _build_action_response(frame_meta, perception, raw_output)
+    response = _build_action_response(frame_meta, perception, raw_output, planned_actions)
 
     logger.info(
         "Returning %d action(s) for session=%s step=%d",

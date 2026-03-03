@@ -11,6 +11,10 @@ Or from repo root:
 Environment variables (optional):
     NAVIGATOR_SERVER   Server URL to pre-populate (default: http://localhost:8080)
     NAVIGATOR_GOAL     Task goal to pre-populate
+    GEMINI_API_KEY     If set, silently seeds the OS keystore so the API-key
+                       dialog is skipped on first launch.  The same variable
+                       used to start the server is therefore sufficient for
+                       the client as well.
 """
 
 from __future__ import annotations
@@ -51,6 +55,18 @@ def main() -> int:
         window.server_input.setText(server_env)
     if goal_env:
         window.task_input.setText(goal_env)
+
+    # If GEMINI_API_KEY is present in the environment (e.g. the same shell
+    # session used to launch the server), seed the OS keystore silently so
+    # the API-key dialog is never shown.  An already-stored key is left
+    # untouched — the env var only fills in the gap on a fresh machine.
+    key_env = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key_env and not window._keystore.exists():
+        window._keystore.save(key_env)
+        window._refresh_key_status_label()
+        logging.getLogger(__name__).info(
+            "API key seeded from GEMINI_API_KEY environment variable"
+        )
 
     window.show()
     return app.exec()

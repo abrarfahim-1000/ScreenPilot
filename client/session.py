@@ -38,7 +38,9 @@ _HEALTH_ENDPOINT = "/health"
 _LOOP_INTERVAL_S: float = 2.5
 
 # Connection / read timeout for requests.
-_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 30.0)
+# The server makes two sequential Gemini API calls (perceive + plan).
+# Each can take 15–30 s; use a generous read timeout so we never drop a step.
+_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 90.0)
 
 
 def _ts() -> str:
@@ -65,7 +67,9 @@ class SessionManager(QThread):
     status_changed: pyqtSignal = pyqtSignal(str, int)
     frame_ready: pyqtSignal = pyqtSignal(bytes)
     session_ended: pyqtSignal = pyqtSignal(str)
-    auth_error: pyqtSignal = pyqtSignal(str)   # emitted on HTTP 401/403
+    auth_error: pyqtSignal = pyqtSignal(str)       # emitted on HTTP 401/403
+    task_completed: pyqtSignal = pyqtSignal(str)   # emitted when model declares goal achieved
+    hand_off_requested: pyqtSignal = pyqtSignal(str)  # emitted when HAND_OFF_TO_USER received
 
     def __init__(
         self,
@@ -110,10 +114,13 @@ class SessionManager(QThread):
 
         try:
             while not self._stop_requested:
-                self._run_one_step()
+                ended_with_verify = self._run_one_step()
                 if not self._stop_requested:
-                    # pause before next capture
-                    self.msleep(int(_LOOP_INTERVAL_S * 1000))
+                    # After a VERIFY-terminated plan, re-check quickly (500 ms)
+                    # so the agent sees the result of its actions sooner.
+                    # Otherwise, use the normal polling interval.
+                    wait_ms = 500 if ended_with_verify else int(_LOOP_INTERVAL_S * 1000)
+                    self.msleep(wait_ms)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled error in session loop")
             self._log(f"✗ Fatal error: {exc}")
@@ -123,13 +130,22 @@ class SessionManager(QThread):
             self._log(f"Session ended: {reason}")
             self.session_ended.emit(reason)
 
-    def _run_one_step(self) -> None:
+    def _run_one_step(self) -> bool:
+        """
+        Run one full perception → plan → execute cycle.
+
+        Returns
+        -------
+        bool
+            True if the plan ended with a VERIFY action (signals that the agent
+            wants a quick re-check rather than the normal 2.5 s wait).
+        """
         # 1. Capture frame
         try:
             frame: CapturedFrame = self._capturer.capture_once()
         except Exception as exc:
             self._log(f"✗ Capture failed: {exc}")
-            return
+            return False
 
         # Emit latest JPEG for display
         self.frame_ready.emit(frame.jpeg_bytes)
@@ -142,7 +158,7 @@ class SessionManager(QThread):
         response_data = self._send_frame(frame)
         if response_data is None:
             self._emit_status("Error", self._step_id)
-            return
+            return False
 
         # 3. Log perception summary
         perception = response_data.get("perception", {})
@@ -157,6 +173,22 @@ class SessionManager(QThread):
         actions: list[dict] = response_data.get("actions", [])
         self._log(f"  {len(actions)} action(s) to execute")
 
+        # ── Task-completion detection ────────────────────────────────
+        # Per planning rule 10: "If the task goal is already complete,
+        # output only a VERIFY action."  A single-action [VERIFY] plan
+        # is the model's explicit signal that the goal has been reached.
+        if len(actions) == 1 and actions[0].get("type", "").upper() == "VERIFY":
+            completion_note = (
+                perception.get("screen_summary")
+                or "Task complete as confirmed by the agent."
+            )
+            self._log(f"  ✓ Task completed — agent reports goal achieved")
+            self._log(f"  Screen: {completion_note}")
+            self._stop_requested = True
+            self.task_completed.emit(completion_note)
+            return True
+
+        ended_with_verify = False
         for action in actions:
             if self._stop_requested:
                 break
@@ -170,15 +202,37 @@ class SessionManager(QThread):
             except Exception:
                 pass
 
-            # Stop if ABORT returned
-            if action.get("type", "").upper() == "ABORT":
+            action_type = action.get("type", "").upper()
+
+            # Stop on ABORT ───────────────────────────────────────────
+            if action_type == "ABORT":
                 self._log("  ⛔ ABORT action received — stopping session")
                 self._stop_requested = True
                 break
 
-            # Pause and let UI settle between actions
+            # Pause and request human help on HAND_OFF_TO_USER ────────
+            if action_type == "HAND_OFF_TO_USER":
+                message = (
+                    action.get("summary")
+                    or action.get("reason")
+                    or "The agent cannot proceed — human action required."
+                )
+                self._log(f"  🤚 HAND_OFF_TO_USER — pausing session: {message}")
+                self._stop_requested = True
+                self.hand_off_requested.emit(message)
+                break
+
+            # Track whether the plan ended with a VERIFY ──────────────
+            if action_type == "VERIFY":
+                ended_with_verify = True
+            else:
+                ended_with_verify = False
+
+            # Pause and let UI settle between physical actions
             if not result.skipped:
                 self.msleep(300)
+
+        return ended_with_verify
 
     def _api_headers(self) -> dict:
         """HTTP headers injected into every request to the server."""

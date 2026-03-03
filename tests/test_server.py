@@ -115,16 +115,35 @@ def test_client(good_perception):
     """
     FastAPI TestClient with GeminiPerceptionClient fully mocked.
     Yields (TestClient, mock_gemini_instance) so tests can override
-    perceive() return values.
+    perceive() / plan() return values.
+
+    Sets a dummy GEMINI_API_KEY env var so the lifespan initialises
+    _gemini_client with the mock instance (avoids 503 in tests that
+    don't supply an X-Gemini-Api-Key header).
     """
+    default_plan = [
+        {
+            "type": "WAIT",
+            "ms": 500,
+            "reason": "Test default plan: wait",
+        },
+        {
+            "type": "VERIFY",
+            "method": "visual",
+            "description": "Visual precision check: default test plan",
+            "reason": "Mandatory VERIFY",
+        },
+    ]
     with patch("app.GeminiPerceptionClient") as MockClass:
-        mock_instance = MockClass.return_value
-        mock_instance.model = "gemini-2.0-flash"
-        mock_instance.perceive.return_value = (good_perception, "raw_model_output_text")
-        # Import app here so the patched class is in effect at import time
-        import app as app_module
-        with TestClient(app_module.app) as client:
-            yield client, mock_instance
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-fake-api-key-for-tests"}):
+            mock_instance = MockClass.return_value
+            mock_instance.model = "gemini-2.5-pro"
+            mock_instance.perceive.return_value = (good_perception, "raw_model_output_text")
+            mock_instance.plan.return_value = (default_plan, "plan_raw_output_text")
+            # Import app here so the patched class is in effect at import time
+            import app as app_module
+            with TestClient(app_module.app) as client:
+                yield client, mock_instance
 
 
 # ─────────────────────────────────────────────────────────────────────────────

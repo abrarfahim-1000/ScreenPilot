@@ -1,4 +1,4 @@
-# UI Navigator Project Plan (Gemini Live Agent Challenge 2026)
+# Local to Cloud Project Plan (Gemini Live Agent Challenge 2026)
 
 **Project codename:** Local-to-Cloud Terminal Navigator (UI Navigator category)  
 **Goal:** Build a *screen-native* agent that can **see the UI**, **plan**, **take OS-level actions**, **verify outcomes**, and **recover** across **browser + terminal + cloud console**.  
@@ -264,7 +264,7 @@ Log (stored in Firestore; large artifacts in GCS):
 - [x] Gemini call returns "next action" JSON (with modal pre-check in prompt)
 - [x] Client executes actions (click/type/wait)
 - [x] Basic UI to start/stop session
-- [ ] **Frame compression: JPEG 70%, max 1280×720 — set as Day 1 constraint, not polish**
+- [x] Frame compression: JPEG 70%, max 1280×720
 
 Deliverable: **Agent can open a webpage and click a visible button. Secrets never leave the client unredacted.**
 

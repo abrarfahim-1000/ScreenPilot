@@ -495,6 +495,8 @@ class ControlPanel(QMainWindow):
         self._session.frame_ready.connect(self._update_frame_display)
         self._session.session_ended.connect(self._on_session_ended)
         self._session.auth_error.connect(self._on_auth_error)
+        self._session.task_completed.connect(self._on_task_completed)
+        self._session.hand_off_requested.connect(self._on_hand_off_requested)
 
         self._set_session_active(True)
         self._append_log(f"[UI] Starting session — server: {server}")
@@ -522,6 +524,42 @@ class ControlPanel(QMainWindow):
             self._keystore.delete()
             self._refresh_key_status_label()
             self._append_log("[UI] API key removed from credential store")
+
+    def _on_task_completed(self, summary: str) -> None:
+        """
+        Called when the planner returns a VERIFY-only plan — the agent believes
+        the task goal has been fully achieved.  Stops the session and notifies
+        the user.
+        """
+        self._set_session_active(False)
+        self._append_log("[UI] \u2713 Task completed successfully")
+        self._append_log(f"[UI]   Screen state: {summary}")
+        self.statusBar().showMessage("Task completed successfully")
+        QMessageBox.information(
+            self,
+            "Task Completed",
+            f"The agent has finished the task.\n\n{summary}\n\n"
+            "You can start a new session with a different goal.",
+        )
+
+    def _on_hand_off_requested(self, message: str) -> None:
+        """
+        Called when the agent returns HAND_OFF_TO_USER — it cannot safely
+        proceed and requires the user to take a manual action first.
+        Stops the session and shows a blocking explanation dialog.
+        """
+        self._set_session_active(False)
+        self._append_log("[UI] \u270b Agent paused \u2014 human action required")
+        self._append_log(f"[UI]   Reason: {message}")
+        self.statusBar().showMessage("Paused \u2014 waiting for user action")
+        QMessageBox.warning(
+            self,
+            "Agent Needs Your Help",
+            "The agent has paused and requires human intervention:\n\n"
+            f"{message}\n\n"
+            "Please complete the requested action manually, "
+            "then start a new session to continue.",
+        )
 
     def _on_auth_error(self, detail: str) -> None:
         """
