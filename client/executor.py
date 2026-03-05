@@ -17,10 +17,20 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pyautogui
+from command_policy import execute_command as _policy_execute
+from log_parser import (
+    _is_safe_read_path,
+    generate_deployment_report,
+    parse_test_log,
+    TestSummary,
+    MAX_READ_BYTES,
+)
 from redaction import redact_text
+from window_focus import focus_window
 
 # pyautogui safety: disable the fail-safe corner but keep a short pause between actions
 pyautogui.FAILSAFE = True       # move mouse to top-left corner to abort
@@ -95,6 +105,10 @@ class ActionExecutor:
             "COPY":             self._copy,
             "PASTE":            self._paste,
             "VERIFY":           self._verify,
+            "EXEC_COMMAND":     self._exec_command,
+            "READ_FILE":        self._read_file,
+            "PARSE_LOG":        self._parse_log,
+            "WRITE_REPORT":     self._write_report,
             "ABORT":            self._abort,
             "HAND_OFF_TO_USER": self._hand_off,
         }
@@ -109,26 +123,17 @@ class ActionExecutor:
 
     def _focus_window(self, action: dict) -> ExecutionResult:
         title = action.get("title_contains", "")
-        try:
-            import pygetwindow as gw
-            wins = gw.getWindowsWithTitle(title)
-            if not wins:
-                return ExecutionResult("FOCUS_WINDOW", False, f"No window found matching '{title}'")
-            win = wins[0]
-            # Use ctypes on Windows for reliable foreground activation.
-            # pygetwindow's .activate() is often ignored by the OS when another
-            # app has the lock; SetForegroundWindow + ShowWindow bypass that.
-            try:
-                import ctypes
-                hwnd = win._hWnd          # Win32Window exposes _hWnd
-                ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
-            except Exception:
-                win.activate()            # fallback for non-Windows / missing _hWnd
-            time.sleep(0.6)               # give window time to receive keyboard focus
-            return ExecutionResult("FOCUS_WINDOW", True, f"Focused '{win.title}'")
-        except Exception as exc:  # noqa: BLE001
-            return ExecutionResult("FOCUS_WINDOW", False, f"Could not focus window: {exc}")
+        threshold = action.get("fuzzy_threshold", 70)
+        result = focus_window(title, fuzzy_threshold=threshold)
+        return ExecutionResult(
+            "FOCUS_WINDOW",
+            result.success,
+            result.message,
+            extra={
+                "match_type": result.match_type,
+                "matched_title": result.matched_title,
+            },
+        )
 
     def _click(self, action: dict) -> ExecutionResult:
         x, y = action.get("x", 0), action.get("y", 0)
@@ -225,12 +230,255 @@ class ActionExecutor:
         return ExecutionResult("PASTE", True, "Ctrl+V sent")
 
     def _verify(self, action: dict) -> ExecutionResult:
-        desc = action.get("description", "(no description)")
-        # VERIFY is a signal to re-capture; no physical action needed
+        method = action.get("method", "visual")
+        desc   = action.get("description", "(no description)")
+
+        if method == "read_file":
+            path = (action.get("path") or "").strip()
+            if path:
+                read_result = self._read_file({"path": path})
+                if read_result.success:
+                    content   = read_result.extra.get("content", "")
+                    must_see  = action.get("must_see") or []
+                    missing   = [
+                        s for s in must_see
+                        if s.lower() not in content.lower()
+                    ]
+                    if missing:
+                        return ExecutionResult(
+                            "VERIFY", False,
+                            f"Visual precision check FAILED — strings not found in "
+                            f"{path}: {missing}",
+                            extra={
+                                "method": "read_file",
+                                "path": path,
+                                "missing": missing,
+                                "content_preview": content[:300],
+                            },
+                        )
+                    return ExecutionResult(
+                        "VERIFY", True,
+                        f"Visual precision check ✓ — {path} readable "
+                        f"({len(content)} chars): {desc}",
+                        extra={
+                            "method": "read_file",
+                            "path": path,
+                            "content_preview": content[:300],
+                        },
+                    )
+                # File could not be read
+                return ExecutionResult(
+                    "VERIFY", False,
+                    f"Visual precision check FAILED — cannot read "
+                    f"{path}: {read_result.message}",
+                )
+
+        # Default: VERIFY is a signal to re-capture; no physical action needed.
         return ExecutionResult(
             "VERIFY", True,
             f"Verify queued: {desc}",
             skipped=True,
+        )
+
+    def _exec_command(self, action: dict) -> ExecutionResult:
+        cmd = action.get("command", "").strip()
+        if not cmd:
+            return ExecutionResult("EXEC_COMMAND", False, "Empty command — skipped")
+
+        timeout_s = int(action.get("timeout_s", 60))
+        cmd_result = _policy_execute(cmd, timeout_s=timeout_s)
+
+        if cmd_result.blocked:
+            logger.warning("EXEC_COMMAND blocked by policy: %s", cmd_result.block_reason)
+            return ExecutionResult(
+                "EXEC_COMMAND",
+                False,
+                f"Blocked by policy: {cmd_result.block_reason}",
+                extra={"command": cmd, "blocked": True},
+            )
+
+        success = cmd_result.returncode == 0
+        msg = (
+            f"returncode={cmd_result.returncode} "
+            f"duration={cmd_result.duration_ms:.0f}ms"
+            + (" [TIMEOUT]" if cmd_result.timed_out else "")
+        )
+        return ExecutionResult(
+            "EXEC_COMMAND",
+            success,
+            msg,
+            extra={
+                "command": cmd,
+                "returncode": cmd_result.returncode,
+                "stdout": cmd_result.stdout[:500],  # truncate for logging
+                "stderr": cmd_result.stderr[:200],
+                "timed_out": cmd_result.timed_out,
+            },
+        )
+
+    # ── File / log actions (Checkpoint 1 & 2, Days 3-5) ────────────────────
+
+    def _read_file(self, action: dict) -> ExecutionResult:
+        """
+        Read a file directly from disk — no shell command, no OCR.
+
+        Returns the file content in ``extra["content"]`` so the orchestrator
+        can inspect it on the next loop iteration without a screenshot.
+        The tail of the file is kept when it exceeds *max_bytes*.
+        """
+        path = (action.get("path") or "").strip()
+        if not path:
+            return ExecutionResult("READ_FILE", False, "No path specified — skipped")
+
+        max_bytes = min(
+            int(action.get("max_bytes", MAX_READ_BYTES)),
+            MAX_READ_BYTES,
+        )
+
+        safe, reason = _is_safe_read_path(path)
+        if not safe:
+            logger.warning("READ_FILE blocked: %s", reason)
+            return ExecutionResult(
+                "READ_FILE", False,
+                f"Path safety check failed: {reason}",
+                extra={"path": path, "blocked": True},
+            )
+
+        try:
+            raw = Path(path).read_bytes()
+        except FileNotFoundError:
+            return ExecutionResult(
+                "READ_FILE", False,
+                f"File not found: {path}",
+                extra={"path": path},
+            )
+        except OSError as exc:
+            return ExecutionResult(
+                "READ_FILE", False,
+                f"Failed to read file: {exc}",
+                extra={"path": path},
+            )
+
+        truncated = len(raw) > max_bytes
+        if truncated:
+            raw = raw[-max_bytes:]   # keep the tail — test summaries are at the end
+        content = raw.decode("utf-8", errors="replace")
+
+        msg = (
+            f"Read {len(content)} chars from {path}"
+            + (" (truncated to tail)" if truncated else "")
+        )
+        return ExecutionResult(
+            "READ_FILE", True, msg,
+            extra={"path": path, "content": content, "truncated": truncated},
+        )
+
+    def _parse_log(self, action: dict) -> ExecutionResult:
+        """
+        Parse a test runner log file (pytest / unittest / make test) and return
+        a structured test summary in ``extra``.  Uses the client-side
+        :func:`parse_test_log` — no screenshot OCR, no Gemini API call needed.
+        """
+        path = (action.get("path") or "").strip()
+        if not path:
+            return ExecutionResult("PARSE_LOG", False, "No path specified — skipped")
+
+        # Allow the caller to inject content directly (useful in testing and when
+        # the content was already fetched via a READ_FILE action).
+        content  = action.get("content") or None
+        exit_code = action.get("exit_code")
+
+        summary = parse_test_log(path, content=content, exit_code=exit_code)
+
+        # Treat as success if we got a recognisable count or at least a snippet
+        success = (summary.total > 0) or bool(summary.raw_snippet)
+        msg = f"Parsed {summary.parser_format} log — {summary.summary_line}"
+        if summary.parse_errors:
+            msg += f" | warnings: {'; '.join(summary.parse_errors)}"
+
+        return ExecutionResult(
+            "PARSE_LOG", success, msg,
+            extra={
+                "path": path,
+                "total":         summary.total,
+                "passed":        summary.passed,
+                "failed":        summary.failed,
+                "errors":        summary.errors,
+                "skipped":       summary.skipped,
+                "warnings":      summary.warnings,
+                "duration_s":    summary.duration_s,
+                "test_success":  summary.success,
+                "summary_line":  summary.summary_line,
+                "parser_format": summary.parser_format,
+                "parse_errors":  summary.parse_errors,
+                "raw_snippet":   summary.raw_snippet,
+                "exit_code":     summary.exit_code,
+            },
+        )
+
+    def _write_report(self, action: dict) -> ExecutionResult:
+        """
+        Generate a :class:`DeploymentReport` from a test log and write it to a
+        file.  Optionally copies the report to the system clipboard so the agent
+        can present it to the user without a browser or editor.
+        """
+        log_path  = (action.get("log_path")   or "").strip()
+        report_path = (action.get("report_path") or "").strip()
+        copy_to_clipboard = bool(action.get("copy_to_clipboard", True))
+
+        # Parse the log (returns empty summary if path is missing/unreadable)
+        if log_path:
+            summary = parse_test_log(
+                log_path,
+                content=action.get("content") or None,
+                exit_code=action.get("exit_code"),
+            )
+        else:
+            summary = TestSummary()
+
+        report = generate_deployment_report(
+            summary=summary,
+            session_id=action.get("session_id", ""),
+            task_goal=action.get("task_goal", ""),
+            gcs_log_url=action.get("gcs_log_url", ""),
+            cloud_run_url=action.get("cloud_run_url", ""),
+            report_path=report_path,
+        )
+
+        # ── Write to file ────────────────────────────────────────────────────
+        written = False
+        try:
+            Path(report.report_path).write_text(report.report_text, encoding="utf-8")
+            written = True
+            logger.info("WRITE_REPORT: report written to %s", report.report_path)
+        except OSError as exc:
+            logger.warning("WRITE_REPORT: failed to write report file: %s", exc)
+
+        # ── Copy to clipboard ─────────────────────────────────────────────────
+        clipped = False
+        if copy_to_clipboard:
+            try:
+                import pyperclip  # lazy import — same pattern as _type()
+                pyperclip.copy(report.report_text)
+                clipped = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("WRITE_REPORT: clipboard copy failed: %s", exc)
+
+        msg = (
+            "Report generated"
+            + (f" → {report.report_path}" if written else " (write failed)")
+            + (" + copied to clipboard" if clipped else "")
+        )
+        return ExecutionResult(
+            "WRITE_REPORT", written or clipped, msg,
+            extra={
+                "report_path":  report.report_path,
+                "report_text":  report.report_text,
+                "written":      written,
+                "clipped":      clipped,
+                "test_success": report.test_summary.success
+                                if report.test_summary else None,
+            },
         )
 
     def _abort(self, action: dict) -> ExecutionResult:

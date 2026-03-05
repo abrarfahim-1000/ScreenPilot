@@ -269,10 +269,10 @@ Log (stored in Firestore; large artifacts in GCS):
 Deliverable: **Agent can open a webpage and click a visible button. Secrets never leave the client unredacted.**
 
 ### Days 3–5: Terminal workflow
-- [ ] Add focus window by title
-- [ ] Implement safe command execution flow (allowlist enforced)
-- [ ] **Pipe terminal output to file (`make test 2>&1 | tee /tmp/test_out.log`) — read file directly, not screenshot OCR**
-- [ ] Parse test summary from log file + write deployment report
+- [x] Add focus window by title
+- [x] Implement safe command execution flow (allowlist enforced)
+- [x] **Pipe terminal output to file (`make test 2>&1 | tee /tmp/test_out.log`) — read file directly, not screenshot OCR**
+- [x] Parse test summary from log file + write deployment report
 
 Deliverable: **Agent runs tests and extracts a reliable summary from file output.**
 

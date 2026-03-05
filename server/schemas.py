@@ -76,7 +76,11 @@ class ActionType(str, Enum):
     DRAG = "DRAG"
     COPY = "COPY"
     PASTE = "PASTE"
-    VERIFY = "VERIFY"   # ← first-class action, not a side effect
+    VERIFY = "VERIFY"         # ← first-class action, not a side effect
+    EXEC_COMMAND = "EXEC_COMMAND"  # ← safe terminal command execution (policy-gated)
+    READ_FILE = "READ_FILE"      # ← read a file directly (no OCR, no shell)
+    PARSE_LOG = "PARSE_LOG"      # ← parse test log → structured TestSummary
+    WRITE_REPORT = "WRITE_REPORT"  # ← generate + write deployment report
     ABORT = "ABORT"
     HAND_OFF_TO_USER = "HAND_OFF_TO_USER"
 
@@ -86,6 +90,10 @@ class ActionType(str, Enum):
 class FocusWindowAction(BaseModel):
     type: Literal[ActionType.FOCUS_WINDOW] = ActionType.FOCUS_WINDOW
     title_contains: str
+    fuzzy_threshold: int = Field(
+        70, ge=0, le=100,
+        description="Minimum rapidfuzz WRatio score (0–100) for fuzzy title matching",
+    )
     reason: str = ""
 
 
@@ -173,6 +181,73 @@ class VerifyAction(BaseModel):
     reason: str = ""
 
 
+class ExecCommandAction(BaseModel):
+    """
+    Execute a shell command on the desktop client after passing the policy gate
+    (allowlist / blocklist check in command_policy.py).  The result — including
+    stdout, stderr, and returncode — is returned as part of the ExecutionResult
+    so the cloud orchestrator can inspect it on the next loop iteration.
+    """
+    type: Literal[ActionType.EXEC_COMMAND] = ActionType.EXEC_COMMAND
+    command: str = Field(
+        ...,
+        description="Shell command string to execute (subject to client-side policy check)",
+    )
+    timeout_s: int = Field(
+        60, ge=1, le=300,
+        description="Maximum seconds to wait for the command to complete",
+    )
+    reason: str = ""
+
+
+class ReadFileAction(BaseModel):
+    """
+    Read a file directly from disk using Python I/O (no shell command / no OCR).
+    Content is returned in ExecutionResult.extra["content"] so the orchestrator
+    can inspect it on the next loop iteration.
+    """
+    type: Literal[ActionType.READ_FILE] = ActionType.READ_FILE
+    path: str = Field(..., description="Path to the file to read (safety-checked)")
+    max_bytes: int = Field(
+        65536, ge=1, le=1_048_576,
+        description="Max bytes to read from the tail of the file (default 64 KB)",
+    )
+    reason: str = ""
+
+
+class ParseLogAction(BaseModel):
+    """
+    Parse a test runner log file and return a structured TestSummary via
+    the client-side log_parser module.  Supports pytest and unittest formats.
+    """
+    type: Literal[ActionType.PARSE_LOG] = ActionType.PARSE_LOG
+    path: str = Field(..., description="Path to the test log file to parse")
+    reason: str = ""
+
+
+class WriteReportAction(BaseModel):
+    """
+    Generate a DeploymentReport from a test log and write it to a file.
+    Optionally copies the report text to the system clipboard.
+    """
+    type: Literal[ActionType.WRITE_REPORT] = ActionType.WRITE_REPORT
+    log_path: str = Field(
+        "", description="Path to the test log file to include in the report"
+    )
+    session_id: str = ""
+    task_goal: str = ""
+    gcs_log_url: str = ""
+    cloud_run_url: str = ""
+    report_path: str = Field(
+        "",
+        description="Destination file path. Auto-generated under OS temp dir if empty.",
+    )
+    copy_to_clipboard: bool = Field(
+        True, description="Copy report text to the system clipboard after writing"
+    )
+    reason: str = ""
+
+
 class AbortAction(BaseModel):
     type: Literal[ActionType.ABORT] = ActionType.ABORT
     reason: str = ""
@@ -198,6 +273,10 @@ ActionItem = Union[
     CopyAction,
     PasteAction,
     VerifyAction,
+    ExecCommandAction,
+    ReadFileAction,
+    ParseLogAction,
+    WriteReportAction,
     AbortAction,
     HandOffAction,
 ]
