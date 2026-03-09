@@ -3,6 +3,7 @@ app.py — Cloud Run FastAPI orchestrator for UI Navigator.
 
 Endpoints:
     GET  /health               Liveness / readiness check
+    POST /session/plan         Plan-first mode: decompose task into steps
     POST /session/frame        Main loop: receive frame + metadata → return actions
 
 The /session/frame endpoint:
@@ -30,7 +31,8 @@ from fastapi.responses import JSONResponse
 
 import re as _re
 
-from gemini import GeminiPerceptionClient
+from firestore_session import FirestoreSessionStore
+from gemini import GeminiPerceptionClient, build_plan_session_prompt
 from schemas import (
     ActionExpected,
     ActionResponse,
@@ -38,6 +40,9 @@ from schemas import (
     HealthResponse,
     FrameMetadata,
     OnFailure,
+    PlanRequest,
+    PlanStep,
+    SessionPlan,
     VerifyAction,
     WaitAction,
 )
@@ -46,16 +51,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _gemini_client: GeminiPerceptionClient | None = None
+_session_store: FirestoreSessionStore | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _gemini_client
+    global _gemini_client, _session_store
     startup_key = os.environ.get("GEMINI_API_KEY", "")
     if startup_key:
         _gemini_client = GeminiPerceptionClient(
             api_key=startup_key,
-            model=os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview"),
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
         )
         logger.info("GeminiPerceptionClient initialised (model=%s)", _gemini_client.model)
     else:
@@ -64,8 +70,18 @@ async def lifespan(app: FastAPI):
             "No GEMINI_API_KEY env var — shared client skipped. "
             "Keys must be supplied per-request via X-Gemini-Api-Key header."
         )
+    # Initialise Firestore session store (best-effort; continues on failure)
+    _session_store = FirestoreSessionStore(
+        project_id=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+        collection=os.environ.get("FIRESTORE_COLLECTION", "ui_navigator_sessions"),
+    )
+    if _session_store.available:
+        logger.info("FirestoreSessionStore ready")
+    else:
+        logger.info("FirestoreSessionStore unavailable — audit logging disabled")
     yield
     _gemini_client = None
+    _session_store = None
 
 
 app = FastAPI(
@@ -236,6 +252,78 @@ async def health_check() -> HealthResponse:
 
 
 @app.post(
+    "/session/plan",
+    response_model=SessionPlan,
+    status_code=status.HTTP_200_OK,
+    tags=["session"],
+    summary="Plan-first mode: decompose a task goal into numbered steps before acting",
+)
+async def plan_session(request: Request, body: PlanRequest) -> JSONResponse:
+    """
+    **Plan-first mode** endpoint.
+
+    Decomposes *body.task_goal* into a :class:`SessionPlan` — a sequence of
+    2–8 milestones, each with its own ``action_goal`` and ``expected`` policy
+    (``max_retries``, ``on_failure``).
+
+    The desktop client calls this **once** at session start, then drives each
+    ``PlanStep.action_goal`` through the normal ``/session/frame`` loop.
+
+    Returns a :class:`SessionPlan` ready for client-side step-by-step execution.
+    """
+    override_key = request.headers.get("X-Gemini-Api-Key", "").strip()
+    if override_key:
+        active_client = GeminiPerceptionClient(
+            api_key=override_key,
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        )
+    elif _gemini_client is not None:
+        active_client = _gemini_client
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Gemini client not initialised and no X-Gemini-Api-Key header provided",
+        )
+
+    steps_raw, raw_output = active_client.generate_session_plan(
+        task_goal=body.task_goal,
+        session_id=body.session_id,
+        context=body.context,
+    )
+
+    try:
+        steps = [PlanStep.model_validate(s) for s in steps_raw]
+    except Exception as exc:
+        logger.error("PlanStep validation error: %s", exc)
+        steps = []
+
+    plan = SessionPlan(
+        session_id=body.session_id,
+        task_goal=body.task_goal,
+        steps=steps,
+        raw_model_output=raw_output,
+    )
+    logger.info(
+        "Session plan: %d step(s) for session=%s goal=%r",
+        len(steps), body.session_id, body.task_goal[:60],
+    )
+
+    # Persist plan to Firestore (best-effort)
+    if _session_store and _session_store.available:
+        _session_store.create_session(
+            session_id=body.session_id,
+            task_goal=body.task_goal,
+        )
+        _session_store.log_session_plan(
+            session_id=body.session_id,
+            task_goal=body.task_goal,
+            steps=[s.model_dump() for s in steps],
+        )
+
+    return JSONResponse(content=plan.model_dump())
+
+
+@app.post(
     "/session/frame",
     response_model=ActionResponse,
     status_code=status.HTTP_200_OK,
@@ -293,7 +381,7 @@ async def process_frame(
     if override_key:
         active_client = GeminiPerceptionClient(
             api_key=override_key,
-            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-pro"),
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
         )
         logger.info("Using per-request API key (session=%s)", frame_meta.session_id)
     elif _gemini_client is not None:
@@ -356,4 +444,28 @@ async def process_frame(
         frame_meta.step_id,
     )
 
+    # ── Firestore audit log (best-effort) ───────────────────────────────
+    if _session_store and _session_store.available:
+        _session_store.log_step(
+            session_id=frame_meta.session_id,
+            step_id=frame_meta.step_id,
+            perception_summary=perception.screen_summary,
+            actions=response.actions,
+            expected=response.expected.model_dump(),
+            raw_model_output=raw_output,
+        )
+        # Log each VERIFY action result eagerly (result unknown server-side,
+        # so mark as "queued" — the client can call a future /session/verify
+        # endpoint to update the outcome once executed).
+        for action in response.actions:
+            if action.get("type") == "VERIFY":
+                _session_store.log_verify(
+                    session_id=frame_meta.session_id,
+                    step_id=frame_meta.step_id,
+                    method=action.get("method", "visual"),
+                    success=True,   # server marks as queued; client updates on failure
+                    description=action.get("description", "(visual precision check)"),
+                )
+
     return JSONResponse(content=response.model_dump())
+

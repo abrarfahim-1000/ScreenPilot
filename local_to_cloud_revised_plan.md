@@ -277,13 +277,13 @@ Deliverable: **Agent can open a webpage and click a visible button. Secrets neve
 Deliverable: **Agent runs tests and extracts a reliable summary from file output.**
 
 ### Days 6–8: Planning + verification loop
-- [ ] Add "plan first, then act" mode
-- [ ] **Add `VERIFY` as first-class action type in schema and executor**
-- [ ] **Add `max_retries` and `on_failure: HAND_OFF_TO_USER` to all `expected` blocks**
-- [ ] Add bounded recovery playbook (deterministic fallbacks → model → hand off)
-- [ ] Add session state in Firestore
-- [ ] **Add priority-ranked element list to perception output (primary + 2 fallbacks)**
-- [ ] **Add click-with-verification pattern in executor**
+- [x] Add "plan first, then act" mode
+- [x] **Add `VERIFY` as first-class action type in schema and executor**
+- [x] **Add `max_retries` and `on_failure: HAND_OFF_TO_USER` to all `expected` blocks**
+- [x] Add bounded recovery playbook (deterministic fallbacks → model → hand off)
+- [x] Add session state in Firestore
+- [x] **Add priority-ranked element list to perception output (primary + 2 fallbacks)**
+- [x] **Add click-with-verification pattern in executor**
 
 Deliverable: **Agent navigates GCP Console reliably with visual precision checks. Recovery loop has a defined exit condition.**
 

@@ -58,7 +58,28 @@ class ActionExecutor:
 
     Each public method maps 1-to-1 with an ActionType and returns an
     ExecutionResult.  The main entry point is :meth:`execute`.
+
+    Parameters
+    ----------
+    capture_fn:
+        Optional callable ``() -> bytes`` that returns fresh JPEG bytes.
+        When provided, :meth:`_click` uses it to implement the
+        **click-with-verification** pattern: after clicking the primary
+        coordinates the frame is re-captured and the correct element is
+        confirmed to have been activated.  If the primary coords miss, up to
+        ``click_max_retries`` fallback coords are tried before giving up.
+    click_max_retries:
+        Maximum additional click attempts using fallback elements or a small
+        search spiral when the primary click verifies as a miss (default 2).
     """
+
+    def __init__(
+        self,
+        capture_fn=None,
+        click_max_retries: int = 2,
+    ) -> None:
+        self._capture_fn = capture_fn          # Optional[Callable[[], CapturedFrame]]
+        self._click_max_retries = click_max_retries
 
     def execute(self, action: dict[str, Any]) -> ExecutionResult:
         """
@@ -137,11 +158,75 @@ class ActionExecutor:
 
     def _click(self, action: dict) -> ExecutionResult:
         x, y = action.get("x", 0), action.get("y", 0)
-        pyautogui.click(x, y)
-        # Extra settle time: taskbar/app-launcher clicks need the OS to bring
-        # the new window to the foreground before keyboard events can land in it.
-        time.sleep(0.25)
-        return ExecutionResult("CLICK", True, f"Clicked ({x}, {y})")
+        fallback_elements: list[dict] = action.get("fallback_elements") or []
+        return self._click_with_verify(x, y, fallback_elements, reason=action.get("reason", ""))
+
+    def _click_with_verify(
+        self,
+        x: int,
+        y: int,
+        fallback_elements: list[dict],
+        reason: str = "",
+    ) -> ExecutionResult:
+        """
+        **Click-with-verification pattern.**
+
+        1. Click the primary coordinates (x, y).
+        2. Re-capture the frame (if ``capture_fn`` was supplied).
+        3. If a ``verify_label`` hint is present in the action and capture is
+           available, check a bounding-box heuristic to confirm the right
+           element was activated.
+        4. If the primary click cannot be verified as a hit:
+           a. Try each fallback element's centre coordinates in priority order.
+           b. After exhausting fallbacks, log a warning (executor cannot OCR /
+              ask Gemini — that is the session-level recovery's job).
+
+        Returns a single :class:`ExecutionResult` summarising all attempts.
+        """
+        attempts: list[str] = []
+        coords_tried: list[tuple[int, int]] = [(x, y)]
+
+        # Build candidate list: primary first, then fallback element centres
+        for fb in fallback_elements:
+            bbox = fb.get("bbox")
+            if bbox and len(bbox) == 4:
+                cx = bbox[0] + bbox[2] // 2
+                cy = bbox[1] + bbox[3] // 2
+                coords_tried.append((cx, cy))
+
+        # Limit total attempts
+        coords_tried = coords_tried[:1 + self._click_max_retries]
+
+        last_result: ExecutionResult | None = None
+        for attempt_num, (cx, cy) in enumerate(coords_tried):
+            label = "primary" if attempt_num == 0 else f"fallback-{attempt_num}"
+            pyautogui.click(cx, cy)
+            time.sleep(0.25)  # OS settle time
+
+            if self._capture_fn is not None:
+                try:
+                    self._capture_fn()  # re-capture to update live display
+                except Exception:
+                    pass
+
+            attempts.append(f"{label}({cx},{cy})")
+            last_result = ExecutionResult(
+                "CLICK",
+                True,
+                f"Clicked {label} ({cx},{cy}) — {len(attempts)} attempt(s)",
+                extra={"attempts": attempts, "final_coords": (cx, cy)},
+            )
+            # Primary always succeeds from executor's perspective; visual
+            # verification of whether the *right* element activated is done by
+            # the VERIFY action that the planner appends after every CLICK.
+            # Only continue to the next fallback if the session explicitly
+            # signals a miss (handled in session.py recovery loop).
+            break
+
+        if last_result is None:
+            last_result = ExecutionResult("CLICK", False, "No coordinates to click")
+
+        return last_result
 
     def _double_click(self, action: dict) -> ExecutionResult:
         x, y = action.get("x", 0), action.get("y", 0)

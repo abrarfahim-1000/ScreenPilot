@@ -135,15 +135,17 @@ def test_client(good_perception):
         },
     ]
     with patch("app.GeminiPerceptionClient") as MockClass:
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-fake-api-key-for-tests"}):
-            mock_instance = MockClass.return_value
-            mock_instance.model = "gemini-2.5-pro"
-            mock_instance.perceive.return_value = (good_perception, "raw_model_output_text")
-            mock_instance.plan.return_value = (default_plan, "plan_raw_output_text")
-            # Import app here so the patched class is in effect at import time
-            import app as app_module
-            with TestClient(app_module.app) as client:
-                yield client, mock_instance
+        with patch("app.FirestoreSessionStore") as MockStore:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "test-fake-api-key-for-tests"}):
+                MockStore.return_value.available = False
+                mock_instance = MockClass.return_value
+                mock_instance.model = "gemini-2.5-flash"
+                mock_instance.perceive.return_value = (good_perception, "raw_model_output_text")
+                mock_instance.plan.return_value = (default_plan, "plan_raw_output_text")
+                # Import app here so the patched class is in effect at import time
+                import app as app_module
+                with TestClient(app_module.app) as client:
+                    yield client, mock_instance
 
 
 # ─────────────────────────────────────────────────────────────────────────────

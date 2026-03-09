@@ -203,7 +203,7 @@ def demo_server_planning() -> None:
     )
 
     mock_client = MagicMock(spec=GeminiPerceptionClient)
-    mock_client.model = "gemini-2.5-pro (mocked)"
+    mock_client.model = "gemini-2.5-flash (mocked)"
     mock_client.perceive.return_value = (perception_obj, _perception_response())
 
     from gemini import GeminiPerceptionClient as _RealClient

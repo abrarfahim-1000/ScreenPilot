@@ -77,6 +77,7 @@ class SessionManager(QThread):
         task_goal: str = "",
         session_id: Optional[str] = None,
         api_key: str = "",
+        plan_first: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -84,12 +85,17 @@ class SessionManager(QThread):
         self.task_goal = task_goal
         self.session_id: str = session_id or uuid.uuid4().hex[:12]
         self._api_key: str = api_key
-        self._executor = ActionExecutor()
+        self._plan_first: bool = plan_first       # fetch /session/plan before acting
+        self.session_plan: Optional[dict] = None  # populated by _fetch_session_plan()
         self._stop_requested = False
         self._step_id: int = 0
         self._capturer = FrameCapturer(
             on_frame=lambda f: None,    # we use capture_once(), not the callback
             interval=_LOOP_INTERVAL_S,
+        )
+        # Wire the capturer into the executor for click-with-verification pattern
+        self._executor = ActionExecutor(
+            capture_fn=self._capturer.capture_once,
         )
 
     def request_stop(self) -> None:
@@ -111,6 +117,22 @@ class SessionManager(QThread):
 
         self._log(f"✓ Connected to {self.server_url}")
         self._emit_status("Connected", 0)
+
+        # ── Plan-first mode ──────────────────────────────────────────────
+        # If plan_first=True, ask the server to decompose the task into steps
+        # before starting the action loop.  The plan is stored in
+        # self.session_plan but the loop still drives each step via task_goal
+        # (future work: step the plan instead of a monolithic goal).
+        if self._plan_first and self.task_goal.strip():
+            self._log("Plan-first mode — fetching session plan…")
+            self.session_plan = self._fetch_session_plan()
+            if self.session_plan:
+                step_count = len(self.session_plan.get("steps", []))
+                self._log(f"  ✓ Session plan ready: {step_count} step(s)")
+                for i, step in enumerate(self.session_plan.get("steps", []), 1):
+                    self._log(f"  Step {i}: {step.get('description', '')}")
+            else:
+                self._log("  ⚠ Plan fetch failed — proceeding with monolithic goal")
 
         try:
             while not self._stop_requested:
@@ -171,6 +193,9 @@ class SessionManager(QThread):
 
         # 4. Execute actions
         actions: list[dict] = response_data.get("actions", [])
+        expected: dict = response_data.get("expected", {})
+        max_retries: int = int(expected.get("max_retries", 3))
+        on_failure: str = expected.get("on_failure", "HAND_OFF_TO_USER").upper()
         self._log(f"  {len(actions)} action(s) to execute")
 
         # ── Task-completion detection ────────────────────────────────
@@ -188,7 +213,14 @@ class SessionManager(QThread):
             self.task_completed.emit(completion_note)
             return True
 
+        # Fallback elements from perception for click-with-verify recovery
+        fallback_elements: list[dict] = [
+            e for e in perception.get("elements", [])
+            if e.get("priority", 1) > 1
+        ]
+
         ended_with_verify = False
+        last_major_action_type: str = ""
         for action in actions:
             if self._stop_requested:
                 break
@@ -222,17 +254,140 @@ class SessionManager(QThread):
                 self.hand_off_requested.emit(message)
                 break
 
+            # ── Bounded recovery on VERIFY failure ───────────────────
+            if action_type == "VERIFY" and not result.success and not result.skipped:
+                recovered = self._run_recovery(
+                    failed_action=action,
+                    last_major_action_type=last_major_action_type,
+                    fallback_elements=fallback_elements,
+                    max_retries=max_retries,
+                    on_failure=on_failure,
+                )
+                if not recovered and on_failure == "HAND_OFF_TO_USER":
+                    break
+
             # Track whether the plan ended with a VERIFY ──────────────
             if action_type == "VERIFY":
                 ended_with_verify = True
             else:
                 ended_with_verify = False
+                last_major_action_type = action_type
 
             # Pause and let UI settle between physical actions
             if not result.skipped:
                 self.msleep(300)
 
         return ended_with_verify
+
+    def _run_recovery(
+        self,
+        failed_action: dict,
+        last_major_action_type: str,
+        fallback_elements: list[dict],
+        max_retries: int,
+        on_failure: str,
+    ) -> bool:
+        """
+        **Bounded recovery playbook** (context-aware visual recovery).
+
+        Called when a VERIFY action returns ``success=False``.  Applies
+        deterministic recovery strategies in priority order, up to
+        ``max_retries`` attempts.  After exhausting retries, emits
+        HAND_OFF_TO_USER and sets ``_stop_requested``.
+
+        Recovery strategies (deterministic-first, no extra Gemini call):
+        1. Try fallback elements (priority=2+) from the perception output.
+        2. Scroll down to reveal hidden content.
+        3. Scroll up to reset position.
+        4. Zoom out (CTRL -) to expose off-screen elements.
+        5. Switch tab (CTRL+TAB).
+        6. In-page search (CTRL+F).
+        7. Refocus address bar (CTRL+L) — useful when browser navigation fails.
+
+        Returns True if a recovery attempt was made (regardless of outcome).
+        """
+        description = failed_action.get("description") or failed_action.get("reason") or "unknown"
+        self._log(f"  ⚠ VERIFY failed — starting context-aware visual recovery: {description}")
+
+        # ── Strategy 1: try fallback element clicks ─────────────────
+        if fallback_elements and last_major_action_type == "CLICK":
+            for fb in fallback_elements[:max_retries]:
+                bbox = fb.get("bbox")
+                if bbox and len(bbox) == 4:
+                    cx = bbox[0] + bbox[2] // 2
+                    cy = bbox[1] + bbox[3] // 2
+                    label = fb.get("label", f"fallback@{cx},{cy}")
+                    self._log(f"  ↩ Recovery: clicking fallback element '{label}' at ({cx},{cy})")
+                    result = self._executor.execute({"type": "CLICK", "x": cx, "y": cy, "reason": f"recovery: fallback element '{label}'"})
+                    self._log(f"  {result}")
+                    return True
+
+        # ── Deterministic recovery sequence ─────────────────────────
+        recovery_steps = [
+            (1, "Scroll down to reveal content",
+             {"type": "SCROLL", "dx": 0, "dy": -3, "reason": "recovery: scroll down"}),
+            (2, "Scroll up to reset position",
+             {"type": "SCROLL", "dx": 0, "dy": 3, "reason": "recovery: scroll up"}),
+            (3, "Zoom out to expose off-screen elements",
+             {"type": "HOTKEY", "keys": ["ctrl", "-"], "reason": "recovery: zoom out"}),
+            (4, "Switch tab",
+             {"type": "HOTKEY", "keys": ["ctrl", "tab"], "reason": "recovery: switch tab"}),
+            (5, "In-page search",
+             {"type": "HOTKEY", "keys": ["ctrl", "f"], "reason": "recovery: open search"}),
+            (6, "Refocus address bar",
+             {"type": "HOTKEY", "keys": ["ctrl", "l"], "reason": "recovery: focus address bar"}),
+        ]
+
+        for attempt, (strategy_num, strategy_name, recovery_action) in enumerate(
+            recovery_steps[:max_retries], start=1
+        ):
+            self._log(
+                f"  ↩ Recovery attempt {attempt}/{max_retries}: {strategy_name}"
+            )
+            result = self._executor.execute(recovery_action)
+            self._log(f"  {result}")
+            self.msleep(500)  # let UI settle after recovery action
+
+        # ── Exhausted retries ────────────────────────────────────────
+        summary = (
+            f"VERIFY failed after {max_retries} recovery attempt(s) for: {description}. "
+            f"Last major action: {last_major_action_type}. Human intervention required."
+        )
+        self._log(f"  🤚 Recovery exhausted — {summary}")
+        if on_failure == "HAND_OFF_TO_USER":
+            self._stop_requested = True
+            self.hand_off_requested.emit(summary)
+        elif on_failure == "ABORT":
+            self._stop_requested = True
+            self.session_ended.emit(f"ABORT after recovery failure: {summary}")
+        # on_failure == "RETRY" → let the outer loop continue to the next frame
+        return True
+
+    def _fetch_session_plan(self) -> Optional[dict]:
+        """
+        Call POST /session/plan to decompose self.task_goal into numbered steps.
+
+        Returns the parsed JSON response dict (``SessionPlan`` shape) or None
+        on error.  Non-fatal — the session loop continues even if planning fails.
+        """
+        try:
+            resp = requests.post(
+                f"{self.server_url}/session/plan",
+                headers=self._api_headers(),
+                json={
+                    "session_id": self.session_id,
+                    "task_goal": self.task_goal,
+                    "context": "",
+                },
+                timeout=_REQUEST_TIMEOUT_S,
+            )
+            if resp.status_code != 200:
+                self._log(f"  ✗ /session/plan returned {resp.status_code}: {resp.text[:200]}")
+                return None
+            return resp.json()
+        except Exception as exc:
+            self._log(f"  ✗ /session/plan request failed: {exc}")
+            return None
 
     def _api_headers(self) -> dict:
         """HTTP headers injected into every request to the server."""
