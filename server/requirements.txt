@@ -1,17 +1,3 @@
-# UI Navigator – Python dependencies
-# Install with: pip install -r requirements.txt
-
-# ── Desktop client ────────────────────────────────────────────────────────────
-mss>=9.0.1              # cross-platform screen capture
-Pillow>=10.0.0          # image handling + JPEG compression
-pyautogui>=0.9.54       # mouse / keyboard control
-pynput>=1.7.6           # alternative input control
-pygetwindow>=0.0.9      # window focus helpers (Windows/macOS)
-PyQt6>=6.6.0            # control panel UI
-pyperclip>=1.9.0        # clipboard helper for TYPE actions
-requests>=2.31.0        # HTTP client (frame upload to server)
-keyring>=25.0.0         # OS credential store (Windows Credential Manager / Keychain / Secret Service)
-
 # ── Cloud / server ────────────────────────────────────────────────────────────
 google-genai>=1.65.0    # Gemini via Google GenAI SDK
 google-cloud-storage>=2.16.0  # GCS uploads

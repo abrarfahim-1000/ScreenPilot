@@ -125,7 +125,6 @@ class FirestoreSessionStore:
                     "status": "closed",
                     "ended_at": time.time(),
                     "close_reason": reason,
-                    "step_count": fs.transforms.Increment(0),  # don't reset
                 }
             )
         except Exception as exc:  # noqa: BLE001
@@ -176,7 +175,7 @@ class FirestoreSessionStore:
             # Increment step counter on the session document
             fs = _get_firestore()
             self._db.collection(self._collection).document(session_id).update(
-                {"step_count": fs.transforms.Increment(1)}
+                {"step_count": fs.Increment(1)}
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Firestore log_step failed (step=%d): %s", step_id, exc)

@@ -583,6 +583,18 @@ class GeminiPerceptionClient:
                 "reason": "Mandatory VERIFY appended by orchestrator",
             })
 
+        # Hard cap: truncate to 10 actions but always keep the trailing VERIFY
+        MAX_ACTIONS = 10
+        if len(safe) > MAX_ACTIONS:
+            logger.warning(
+                "Planner returned %d actions — truncating to %d (kept trailing VERIFY)",
+                len(safe), MAX_ACTIONS,
+            )
+            verify = safe[-1] if safe[-1].get("type") == "VERIFY" else None
+            safe = safe[:MAX_ACTIONS - 1]
+            if verify:
+                safe.append(verify)
+
         return safe
 
     @staticmethod

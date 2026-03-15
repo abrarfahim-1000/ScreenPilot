@@ -165,7 +165,8 @@ def _is_safe_read_path(path: str) -> tuple[bool, str]:
     tmpdir = str(Path(tempfile.gettempdir()).resolve())
     cwd = str(Path.cwd().resolve())
 
-    if resolved.startswith(tmpdir) or resolved.startswith(cwd):
+    cwd_parent = str(Path(cwd).parent)
+    if resolved.startswith(tmpdir) or resolved.startswith(cwd) or resolved.startswith(cwd_parent):
         return True, ""
 
     return False, (

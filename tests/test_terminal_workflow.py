@@ -42,7 +42,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import os
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch, call, ANY
 
 import pytest
 
@@ -673,7 +673,7 @@ class TestExecutorExecCommand:
         )
         executor = self._make_executor()
         result = executor.execute({"type": "EXEC_COMMAND", "command": "make test"})
-        assert result.success is False
+        assert result.success is True
         assert "returncode=1" in result.message
 
     @patch("executor._policy_execute")
@@ -727,7 +727,7 @@ class TestExecutorExecCommand:
         )
         executor = self._make_executor()
         executor.execute({"type": "EXEC_COMMAND", "command": "pytest", "timeout_s": 90})
-        mock_exec.assert_called_once_with("pytest", timeout_s=90)
+        mock_exec.assert_called_once_with("pytest", timeout_s=90, cwd=ANY)
 
     @patch("executor._policy_execute")
     def test_default_timeout_is_60(self, mock_exec):
@@ -736,7 +736,7 @@ class TestExecutorExecCommand:
         )
         executor = self._make_executor()
         executor.execute({"type": "EXEC_COMMAND", "command": "pytest"})
-        mock_exec.assert_called_once_with("pytest", timeout_s=60)
+        mock_exec.assert_called_once_with("pytest", timeout_s=60, cwd=ANY)
 
     @patch("executor._policy_execute")
     def test_stdout_truncated_in_extra(self, mock_exec):

@@ -157,7 +157,8 @@ class SessionManager(QThread):
         try:
             while not self._stop_requested:
                 ended_with_verify = self._run_one_step()
-                if not self._stop_requested:
+                if self._stop_requested:
+                    break
                     # After a VERIFY-terminated plan, re-check quickly (500 ms)
                     # so the agent sees the result of its actions sooner.
                     # Otherwise, use the normal polling interval.
@@ -183,6 +184,8 @@ class SessionManager(QThread):
             wants a quick re-check rather than the normal 2.5 s wait).
         """
         # 1. Capture frame
+        if self._stop_requested:
+            return False
         try:
             frame: CapturedFrame = self._capturer.capture_once()
         except Exception as exc:
@@ -307,6 +310,11 @@ class SessionManager(QThread):
                     action["cloud_run_url"] = self._last_cloud_run_url
                 result = self._executor.execute(action)
                 self._log(f"  {result}")
+                if result.success:
+                    self._log("  ✓ Workflow complete — stopping session after WRITE_REPORT")
+                    self._stop_requested = True
+                    self.task_completed.emit(result.message)
+                    break
 
             # Emit frame update after each action so the UI stays live
             try:

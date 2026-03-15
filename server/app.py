@@ -458,6 +458,10 @@ async def process_frame(
 
     # ── Firestore audit log (best-effort) ───────────────────────────────
     if _session_store and _session_store.available:
+        _session_store.create_session(
+        session_id=frame_meta.session_id,
+        task_goal=frame_meta.task_goal,
+    )
         _session_store.log_step(
             session_id=frame_meta.session_id,
             step_id=frame_meta.step_id,
