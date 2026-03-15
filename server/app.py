@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 import re as _re
 
 from firestore_session import FirestoreSessionStore
+from gcs_storage import GCSArtifactStore
 from gemini import GeminiPerceptionClient, build_plan_session_prompt
 from schemas import (
     ActionExpected,
@@ -52,11 +53,12 @@ logger = logging.getLogger(__name__)
 
 _gemini_client: GeminiPerceptionClient | None = None
 _session_store: FirestoreSessionStore | None = None
+_gcs_store: GCSArtifactStore | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _gemini_client, _session_store
+    global _gemini_client, _session_store, _gcs_store
     startup_key = os.environ.get("GEMINI_API_KEY", "")
     if startup_key:
         _gemini_client = GeminiPerceptionClient(
@@ -79,9 +81,19 @@ async def lifespan(app: FastAPI):
         logger.info("FirestoreSessionStore ready")
     else:
         logger.info("FirestoreSessionStore unavailable — audit logging disabled")
+    # Initialise GCS artifact store (best-effort; continues on failure)
+    _gcs_store = GCSArtifactStore(
+        bucket_name=os.environ.get("GCS_BUCKET"),
+        project_id=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+    )
+    if _gcs_store.available:
+        logger.info("GCSArtifactStore ready (bucket=%s)", _gcs_store.bucket_name)
+    else:
+        logger.info("GCSArtifactStore unavailable — artifact uploads disabled")
     yield
     _gemini_client = None
     _session_store = None
+    _gcs_store = None
 
 
 app = FastAPI(
@@ -468,4 +480,68 @@ async def process_frame(
                 )
 
     return JSONResponse(content=response.model_dump())
+
+
+# ── Upload endpoint ──────────────────────────────────────────────────────────
+
+@app.post(
+    "/session/upload",
+    status_code=status.HTTP_200_OK,
+    tags=["session"],
+    summary="Upload a session artifact (log, report, screenshot) to Google Cloud Storage",
+)
+async def upload_artifact(
+    request: Request,
+    file: UploadFile,
+    session_id: Annotated[str, Form()] = "",
+    object_name: Annotated[str, Form()] = "",
+) -> JSONResponse:
+    """
+    Upload a file to Google Cloud Storage and return the ``gs://`` URL.
+
+    - **file**: The file to upload (any content type)
+    - **session_id**: Session identifier (used to build the GCS object path if
+      ``object_name`` is not supplied)
+    - **object_name**: Optional explicit GCS object path override.  When omitted,
+      defaults to ``sessions/{session_id}/artifacts/{filename}``.
+
+    Returns ``{"uploaded": true, "gcs_url": "gs://...", "size_bytes": N}`` on success,
+    or ``{"uploaded": false, "gcs_url": "", "size_bytes": N}`` when GCS is unavailable.
+    """
+    data = await file.read()
+    filename = file.filename or "artifact"
+
+    # Build object name: explicit override → session-scoped path → fallback
+    if not object_name:
+        sid = session_id or "unknown"
+        object_name = f"sessions/{sid}/artifacts/{filename}"
+
+    content_type = file.content_type or "application/octet-stream"
+
+    gcs_url = ""
+    if _gcs_store and _gcs_store.available:
+        gcs_url = _gcs_store.upload_bytes(data, object_name, content_type)
+        if gcs_url:
+            logger.info(
+                "Artifact uploaded: session=%s object=%s size=%d",
+                session_id or "unknown",
+                object_name,
+                len(data),
+            )
+        else:
+            logger.warning("GCS upload returned empty URL for object=%s", object_name)
+    else:
+        logger.info(
+            "GCS unavailable — artifact not stored (session=%s file=%s)",
+            session_id or "unknown",
+            filename,
+        )
+
+    return JSONResponse({
+        "uploaded": bool(gcs_url),
+        "gcs_url": gcs_url,
+        "object_name": object_name,
+        "size_bytes": len(data),
+        "bucket": (_gcs_store.bucket_name if (_gcs_store and _gcs_store.available) else ""),
+    })
 

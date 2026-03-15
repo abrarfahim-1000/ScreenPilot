@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Optional
@@ -70,6 +71,7 @@ class SessionManager(QThread):
     auth_error: pyqtSignal = pyqtSignal(str)       # emitted on HTTP 401/403
     task_completed: pyqtSignal = pyqtSignal(str)   # emitted when model declares goal achieved
     hand_off_requested: pyqtSignal = pyqtSignal(str)  # emitted when HAND_OFF_TO_USER received
+    confirmation_required: pyqtSignal = pyqtSignal(str)  # emitted when CONFIRM action received
 
     def __init__(
         self,
@@ -89,18 +91,36 @@ class SessionManager(QThread):
         self.session_plan: Optional[dict] = None  # populated by _fetch_session_plan()
         self._stop_requested = False
         self._step_id: int = 0
+        # Artifact URLs captured during execution — injected into WRITE_REPORT
+        self._last_gcs_url: str = ""
+        self._last_cloud_run_url: str = ""
+        # Confirmation gate — threading.Event so the UI thread can unblock this thread
+        self._confirmation_event = threading.Event()
+        self._confirmation_result: bool = False
         self._capturer = FrameCapturer(
             on_frame=lambda f: None,    # we use capture_once(), not the callback
             interval=_LOOP_INTERVAL_S,
         )
-        # Wire the capturer into the executor for click-with-verification pattern
+        # Wire the capturer + server context into the executor
         self._executor = ActionExecutor(
             capture_fn=self._capturer.capture_once,
+            server_url=self.server_url,
+            session_id=self.session_id,
         )
 
     def request_stop(self) -> None:
         """Signal the loop to exit cleanly after the current step."""
         self._stop_requested = True
+
+    def confirm_action(self, confirmed: bool) -> None:
+        """
+        Called by the UI thread when the user responds to a CONFIRM dialog.
+
+        Sets the result and unblocks the session loop which is waiting on
+        ``_confirmation_event``.  Thread-safe: uses a ``threading.Event``.
+        """
+        self._confirmation_result = confirmed
+        self._confirmation_event.set()
 
     def run(self) -> None:
         self._stop_requested = False
@@ -221,11 +241,72 @@ class SessionManager(QThread):
 
         ended_with_verify = False
         last_major_action_type: str = ""
+        # Track whether the user has confirmed in this step (for DEPLOY_CLOUD_RUN)
+        _user_confirmed: bool = False
+
         for action in actions:
             if self._stop_requested:
                 break
+
+            action_type = action.get("type", "").upper()
+
+            # ── CONFIRM: pause loop and ask the user ──────────────────
+            if action_type == "CONFIRM":
+                message = (
+                    action.get("message")
+                    or "Do you want to proceed with this action?"
+                )
+                action_ref = action.get("action_ref", "")
+                self._log(
+                    f"  ⚠ Confirmation required"
+                    + (f" [{action_ref}]" if action_ref else "")
+                    + f": {message}"
+                )
+                # Reset event for a fresh wait
+                self._confirmation_event.clear()
+                self._confirmation_result = False
+                # Ask UI to show a dialog (emits to main thread)
+                self.confirmation_required.emit(message)
+                # Block the session thread for up to 120 s
+                responded = self._confirmation_event.wait(timeout=120.0)
+                if not responded or not self._confirmation_result:
+                    self._log("  ✗ Action cancelled — user declined (or timed out)")
+                    self._stop_requested = True
+                    break
+                _user_confirmed = True
+                self._log("  ✓ Confirmation received — proceeding")
+                continue  # CONFIRM itself has no physical execution
+
+            # Inject confirmed=True into the immediately following DEPLOY action
+            if action_type == "DEPLOY_CLOUD_RUN" and _user_confirmed:
+                action = dict(action)
+                action["confirmed"] = True
+
             result: ExecutionResult = self._executor.execute(action)
             self._log(f"  {result}")
+
+            # ── Capture artifact URLs for downstream WRITE_REPORT ─────
+            if action_type == "UPLOAD_GCS" and result.success:
+                gcs_url = result.extra.get("gcs_url", "")
+                if gcs_url:
+                    self._last_gcs_url = gcs_url
+                    self._log(f"  ↳ GCS URL captured: {gcs_url}")
+
+            if action_type == "DEPLOY_CLOUD_RUN" and result.success:
+                service_url = result.extra.get("service_url", "")
+                if service_url:
+                    self._last_cloud_run_url = service_url
+                    self._log(f"  ↳ Cloud Run URL captured: {service_url}")
+
+            # Inject captured URLs into WRITE_REPORT before executing
+            if action_type == "WRITE_REPORT":
+                action = dict(action)
+                if not action.get("gcs_log_url") and self._last_gcs_url:
+                    action["gcs_log_url"] = self._last_gcs_url
+                if not action.get("cloud_run_url") and self._last_cloud_run_url:
+                    action["cloud_run_url"] = self._last_cloud_run_url
+                result = self._executor.execute(action)
+                self._log(f"  {result}")
 
             # Emit frame update after each action so the UI stays live
             try:
@@ -233,8 +314,6 @@ class SessionManager(QThread):
                 self.frame_ready.emit(live_frame.jpeg_bytes)
             except Exception:
                 pass
-
-            action_type = action.get("type", "").upper()
 
             # Stop on ABORT ───────────────────────────────────────────
             if action_type == "ABORT":

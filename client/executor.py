@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import requests
+from requests.exceptions import Timeout as _RequestsTimeout
 import pyautogui
 from command_policy import execute_command as _policy_execute
 from log_parser import (
@@ -71,15 +73,24 @@ class ActionExecutor:
     click_max_retries:
         Maximum additional click attempts using fallback elements or a small
         search spiral when the primary click verifies as a miss (default 2).
+    server_url:
+        Base URL of the orchestrator (e.g. ``http://localhost:8080``).  Used
+        by :meth:`_upload_gcs` to POST log artifacts to ``/session/upload``.
+    session_id:
+        Current session identifier, forwarded in GCS upload requests.
     """
 
     def __init__(
         self,
         capture_fn=None,
         click_max_retries: int = 2,
+        server_url: str = "",
+        session_id: str = "",
     ) -> None:
         self._capture_fn = capture_fn          # Optional[Callable[[], CapturedFrame]]
         self._click_max_retries = click_max_retries
+        self._server_url = server_url.rstrip("/")
+        self._session_id = session_id
 
     def execute(self, action: dict[str, Any]) -> ExecutionResult:
         """
@@ -130,6 +141,8 @@ class ActionExecutor:
             "READ_FILE":        self._read_file,
             "PARSE_LOG":        self._parse_log,
             "WRITE_REPORT":     self._write_report,
+            "UPLOAD_GCS":       self._upload_gcs,
+            "DEPLOY_CLOUD_RUN": self._deploy_cloud_run,
             "ABORT":            self._abort,
             "HAND_OFF_TO_USER": self._hand_off,
         }
@@ -563,6 +576,203 @@ class ActionExecutor:
                 "clipped":      clipped,
                 "test_success": report.test_summary.success
                                 if report.test_summary else None,
+            },
+        )
+
+    # ── Cloud integration actions (Days 9-11) ─────────────────────────────
+
+    def _upload_gcs(self, action: dict) -> ExecutionResult:
+        """
+        Upload a local file to Google Cloud Storage via the server's
+        ``/session/upload`` endpoint.  The server handles GCS credentials;
+        the client only reads the local file and POSTs the bytes.
+
+        On success ``extra["gcs_url"]`` contains the ``gs://`` URI returned
+        by the server, and ``extra["uploaded"]`` is ``True``.
+        The SessionManager captures this URL for later WRITE_REPORT actions.
+        """
+        local_path = (action.get("local_path") or "").strip()
+        gcs_object = (action.get("gcs_object") or "").strip()
+        content_type = (action.get("content_type") or "text/plain").strip()
+
+        if not local_path:
+            return ExecutionResult("UPLOAD_GCS", False, "No local_path specified — skipped")
+
+        # Safety check on read path
+        safe, reason = _is_safe_read_path(local_path)
+        if not safe:
+            logger.warning("UPLOAD_GCS blocked: %s", reason)
+            return ExecutionResult(
+                "UPLOAD_GCS", False,
+                f"Path safety check failed: {reason}",
+                extra={"local_path": local_path, "blocked": True},
+            )
+
+        try:
+            data = Path(local_path).read_bytes()
+        except FileNotFoundError:
+            return ExecutionResult(
+                "UPLOAD_GCS", False,
+                f"File not found: {local_path}",
+                extra={"local_path": local_path},
+            )
+        except OSError as exc:
+            return ExecutionResult(
+                "UPLOAD_GCS", False,
+                f"Cannot read file: {exc}",
+                extra={"local_path": local_path},
+            )
+
+        if not self._server_url:
+            return ExecutionResult(
+                "UPLOAD_GCS", False,
+                "No server_url configured — cannot upload (server_url required)",
+                extra={"local_path": local_path},
+            )
+
+        # POST to /session/upload
+        upload_url = f"{self._server_url}/session/upload"
+        filename = Path(local_path).name
+        try:
+            resp = requests.post(
+                upload_url,
+                files={"file": (filename, data, content_type)},
+                data={
+                    "session_id": self._session_id or action.get("session_id", ""),
+                    "object_name": gcs_object,
+                },
+                timeout=(5.0, 60.0),
+            )
+            resp.raise_for_status()
+            result_json = resp.json()
+            gcs_url = result_json.get("gcs_url", "")
+            uploaded = bool(result_json.get("uploaded", gcs_url))
+            size_bytes = result_json.get("size_bytes", len(data))
+
+            if uploaded:
+                return ExecutionResult(
+                    "UPLOAD_GCS", True,
+                    f"Uploaded {size_bytes:,} bytes → {gcs_url}",
+                    extra={
+                        "gcs_url": gcs_url,
+                        "object_name": result_json.get("object_name", gcs_object),
+                        "size_bytes": size_bytes,
+                        "uploaded": True,
+                        "local_path": local_path,
+                    },
+                )
+            else:
+                return ExecutionResult(
+                    "UPLOAD_GCS", False,
+                    "Server accepted upload but GCS was unavailable — artifact not stored",
+                    extra={
+                        "gcs_url": "",
+                        "size_bytes": size_bytes,
+                        "uploaded": False,
+                        "local_path": local_path,
+                    },
+                )
+        except _RequestsTimeout:
+            return ExecutionResult(
+                "UPLOAD_GCS", False,
+                f"Upload timed out after 60 s (server={upload_url})",
+                extra={"local_path": local_path},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ExecutionResult(
+                "UPLOAD_GCS", False,
+                f"Upload failed: {exc}",
+                extra={"local_path": local_path},
+            )
+
+    def _deploy_cloud_run(self, action: dict) -> ExecutionResult:
+        """
+        Deploy a container image to Cloud Run using the ``gcloud run deploy``
+        CLI command.
+
+        Safety requirements
+        -------------------
+        - The action MUST have ``confirmed=True`` (set by the SessionManager
+          after the user confirms the preceding CONFIRM action).  Without it
+          the handler refuses and returns success=False.
+        - The constructed command passes the policy gate in command_policy.py.
+        - Service URL is parsed from gcloud stdout/stderr and returned in
+          ``extra["service_url"]`` for downstream WRITE_REPORT actions.
+        """
+        import re as _re
+
+        if not action.get("confirmed", False):
+            return ExecutionResult(
+                "DEPLOY_CLOUD_RUN", False,
+                "Deployment blocked — user confirmation required. "
+                "Precede this action with a CONFIRM action.",
+                extra={"confirmed": False},
+            )
+
+        service_name = (action.get("service_name") or "").strip()
+        image        = (action.get("image") or "").strip()
+        region       = (action.get("region") or "us-central1").strip()
+        project      = (action.get("project") or "").strip()
+        allow_unauth = bool(action.get("allow_unauthenticated", False))
+        timeout_s    = int(action.get("timeout_s", 300))
+
+        if not service_name or not image:
+            return ExecutionResult(
+                "DEPLOY_CLOUD_RUN", False,
+                "service_name and image are required for DEPLOY_CLOUD_RUN",
+                extra={"service_name": service_name, "image": image},
+            )
+
+        # Build the gcloud command — safe flags only, no shell interpolation
+        parts = [
+            "gcloud", "run", "deploy", service_name,
+            f"--image={image}",
+            f"--region={region}",
+            "--platform=managed",
+        ]
+        if project:
+            parts.append(f"--project={project}")
+        if allow_unauth:
+            parts.append("--allow-unauthenticated")
+
+        cmd = " ".join(parts)
+        logger.info("DEPLOY_CLOUD_RUN: %s", cmd)
+
+        cmd_result = _policy_execute(cmd, timeout_s=timeout_s)
+
+        if cmd_result.blocked:
+            logger.warning("DEPLOY_CLOUD_RUN blocked by policy: %s", cmd_result.block_reason)
+            return ExecutionResult(
+                "DEPLOY_CLOUD_RUN", False,
+                f"Blocked by policy: {cmd_result.block_reason}",
+                extra={"command": cmd, "blocked": True},
+            )
+
+        # Parse Cloud Run service URL from gcloud output
+        combined = (cmd_result.stdout or "") + "\n" + (cmd_result.stderr or "")
+        url_match = _re.search(r"Service URL:\s*(https://[^\s]+)", combined)
+        service_url = url_match.group(1) if url_match else ""
+
+        success = cmd_result.returncode == 0 and not cmd_result.timed_out
+        status_msg = (
+            f"returncode={cmd_result.returncode} "
+            f"duration={cmd_result.duration_ms:.0f}ms"
+            + (" [TIMEOUT]" if cmd_result.timed_out else "")
+            + (f" url={service_url}" if service_url else "")
+        )
+
+        return ExecutionResult(
+            "DEPLOY_CLOUD_RUN", success, status_msg,
+            extra={
+                "command": cmd,
+                "service_url": service_url,
+                "returncode": cmd_result.returncode,
+                "stdout": cmd_result.stdout[:1000],
+                "stderr": cmd_result.stderr[:500],
+                "timed_out": cmd_result.timed_out,
+                "service_name": service_name,
+                "region": region,
+                "project": project,
             },
         )
 

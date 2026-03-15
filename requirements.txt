@@ -27,3 +27,8 @@ rapidfuzz>=3.9.0        # fuzzy string matching (optional OCR helper)
 # ── Dev / testing ─────────────────────────────────────────────────────────────
 pytest>=8.2.0
 pytest-mock>=3.14.0
+
+$env:GEMINI_API_KEY = "your-gemini-api-key"
+# Optional — only needed for GCS upload step:
+$env:GCS_BUCKET = "ltc-1"
+$env:GOOGLE_CLOUD_PROJECT = "localtocloud-489708"

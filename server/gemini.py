@@ -84,7 +84,9 @@ Session: {session_id}  |  Step: {step_id}
 3. Always end the array with a VERIFY action (method="visual").
 4. Use ONLY these action types:
    FOCUS_WINDOW, CLICK, DOUBLE_CLICK, RIGHT_CLICK, TYPE, HOTKEY,
-   SCROLL, WAIT, VERIFY, ABORT, HAND_OFF_TO_USER
+   SCROLL, WAIT, VERIFY, EXEC_COMMAND, READ_FILE, PARSE_LOG,
+   WRITE_REPORT, UPLOAD_GCS, DEPLOY_CLOUD_RUN, CONFIRM,
+   ABORT, HAND_OFF_TO_USER
 5. Field reference:
    {{"type":"FOCUS_WINDOW","title_contains":"...","reason":"..."}}
    {{"type":"CLICK","x":<int>,"y":<int>,"reason":"..."}}
@@ -93,6 +95,14 @@ Session: {session_id}  |  Step: {step_id}
    {{"type":"SCROLL","dx":0,"dy":-3,"reason":"..."}}
    {{"type":"WAIT","ms":1000,"reason":"..."}}
    {{"type":"VERIFY","method":"visual","description":"...","reason":"..."}}
+   {{"type":"VERIFY","method":"read_file","path":"/tmp/test_out.log","must_see":["passed"],"reason":"..."}}
+   {{"type":"EXEC_COMMAND","command":"make test 2>&1 | tee /tmp/test_out.log","timeout_s":120,"reason":"..."}}
+   {{"type":"READ_FILE","path":"/tmp/test_out.log","reason":"..."}}
+   {{"type":"PARSE_LOG","path":"/tmp/test_out.log","reason":"..."}}
+   {{"type":"WRITE_REPORT","log_path":"/tmp/test_out.log","copy_to_clipboard":true,"reason":"..."}}
+   {{"type":"UPLOAD_GCS","local_path":"/tmp/test_out.log","gcs_object":"sessions/{{session_id}}/logs/test_out.log","reason":"..."}}
+   {{"type":"CONFIRM","message":"About to deploy to Cloud Run. Proceed?","action_ref":"DEPLOY_CLOUD_RUN","reason":"..."}}
+   {{"type":"DEPLOY_CLOUD_RUN","service_name":"ui-navigator","image":"gcr.io/PROJECT/IMAGE:TAG","region":"us-central1","project":"PROJECT_ID","allow_unauthenticated":false,"reason":"..."}}
    {{"type":"ABORT","reason":"..."}}
    {{"type":"HAND_OFF_TO_USER","summary":"...","reason":"..."}}
 6. To click a UI element from perception: compute centre as
@@ -111,6 +121,19 @@ Session: {session_id}  |  Step: {step_id}
 9. Never include API keys, passwords, tokens, or any secrets in TYPE text.
 10. If the task goal is already complete, output only a VERIFY action.
 11. If you cannot safely proceed, output HAND_OFF_TO_USER.
+12. **DEPLOY_CLOUD_RUN safety rule:** ALWAYS precede DEPLOY_CLOUD_RUN with a
+    CONFIRM action. Never deploy without explicit user confirmation. The CONFIRM
+    message must describe exactly what will be deployed and to which project/region.
+13. **Cloud integration workflow (Workflow A):**
+    When the goal involves "run tests + upload + deploy", use this sequence:
+    a. FOCUS_WINDOW terminal → EXEC_COMMAND "make test 2>&1 | tee /tmp/test_out.log"
+    b. VERIFY (method=read_file, path=/tmp/test_out.log, must_see=["passed"])
+    c. PARSE_LOG (path=/tmp/test_out.log)
+    d. UPLOAD_GCS (local_path=/tmp/test_out.log)
+    e. CONFIRM (message="Deploy SERVICE to Cloud Run in REGION?")
+    f. DEPLOY_CLOUD_RUN (service_name, image, region, project)
+    g. VERIFY (method=visual) — open GCP Console to confirm service status
+    h. WRITE_REPORT (log_path, copy_to_clipboard=true)
 """
 
 _PERCEPTION_PROMPT_TEMPLATE = """\

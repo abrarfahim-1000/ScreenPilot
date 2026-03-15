@@ -497,6 +497,7 @@ class ControlPanel(QMainWindow):
         self._session.auth_error.connect(self._on_auth_error)
         self._session.task_completed.connect(self._on_task_completed)
         self._session.hand_off_requested.connect(self._on_hand_off_requested)
+        self._session.confirmation_required.connect(self._on_confirmation_required)
 
         self._set_session_active(True)
         self._append_log(f"[UI] Starting session — server: {server}")
@@ -575,6 +576,31 @@ class ControlPanel(QMainWindow):
             "Please enter a valid key.",
         )
         self._on_change_key()
+
+    def _on_confirmation_required(self, message: str) -> None:
+        """
+        Called when the agent emits a CONFIRM action — the session loop is
+        blocked waiting for the user's response.  Shows a blocking Yes/No
+        dialog and forwards the answer to :meth:`SessionManager.confirm_action`.
+        """
+        self._append_log(f"[UI] ⚠ Confirmation requested: {message}")
+        self.statusBar().showMessage("Waiting for your confirmation…")
+        reply = QMessageBox.question(
+            self,
+            "Confirm Action",
+            f"{message}\n\nDo you want to proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,          # safe default: No
+        )
+        confirmed = reply == QMessageBox.StandardButton.Yes
+        label = "✓ confirmed" if confirmed else "✗ declined"
+        self._append_log(f"[UI] Confirmation {label}")
+        self.statusBar().showMessage(
+            "Proceeding with deployment…" if confirmed else "Deployment cancelled by user"
+        )
+        if self._session and hasattr(self._session, "confirm_action"):
+            self._session.confirm_action(confirmed)
+
 
     def _prompt_for_key(self, *, first_time: bool) -> Optional[str]:
         """

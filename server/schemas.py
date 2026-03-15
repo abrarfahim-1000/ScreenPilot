@@ -81,6 +81,9 @@ class ActionType(str, Enum):
     READ_FILE = "READ_FILE"      # ← read a file directly (no OCR, no shell)
     PARSE_LOG = "PARSE_LOG"      # ← parse test log → structured TestSummary
     WRITE_REPORT = "WRITE_REPORT"  # ← generate + write deployment report
+    UPLOAD_GCS = "UPLOAD_GCS"    # ← upload a local file to Google Cloud Storage
+    DEPLOY_CLOUD_RUN = "DEPLOY_CLOUD_RUN"  # ← deploy a service via gcloud CLI (requires CONFIRM)
+    CONFIRM = "CONFIRM"          # ← request explicit user confirmation before destructive action
     ABORT = "ABORT"
     HAND_OFF_TO_USER = "HAND_OFF_TO_USER"
 
@@ -248,6 +251,86 @@ class WriteReportAction(BaseModel):
     reason: str = ""
 
 
+class UploadGCSAction(BaseModel):
+    """
+    Upload a local file to Google Cloud Storage via the server's /session/upload
+    endpoint.  The server handles GCS credentials — the client only reads the
+    local file and POSTs the bytes.
+
+    On success, ExecutionResult.extra["gcs_url"] contains the gs:// URI.
+    The SessionManager automatically captures this URL for use in WRITE_REPORT.
+    """
+    type: Literal[ActionType.UPLOAD_GCS] = ActionType.UPLOAD_GCS
+    local_path: str = Field(
+        ...,
+        description="Absolute or /tmp/-relative path to the file to upload",
+    )
+    gcs_object: str = Field(
+        "",
+        description="GCS object name.  Auto-generated as sessions/{id}/logs/{filename} if empty.",
+    )
+    content_type: str = Field(
+        "text/plain",
+        description="MIME type for the upload (default: text/plain)",
+    )
+    reason: str = ""
+
+
+class DeployCloudRunAction(BaseModel):
+    """
+    Deploy a container image to Google Cloud Run using the ``gcloud run deploy``
+    CLI command.  This action MUST be preceded by a CONFIRM action — the
+    executor will refuse to run without prior user confirmation.
+
+    On success, ExecutionResult.extra["service_url"] contains the service URL.
+    The SessionManager automatically captures this URL for use in WRITE_REPORT.
+    """
+    type: Literal[ActionType.DEPLOY_CLOUD_RUN] = ActionType.DEPLOY_CLOUD_RUN
+    service_name: str = Field(
+        ..., description="Cloud Run service name (e.g. 'ui-navigator')"
+    )
+    image: str = Field(
+        ..., description="Container image URI (e.g. 'gcr.io/PROJECT/image:tag')"
+    )
+    region: str = Field(
+        "us-central1", description="GCP region for the Cloud Run service"
+    )
+    project: str = Field(
+        "", description="GCP project ID (inferred from ADC if empty)"
+    )
+    allow_unauthenticated: bool = Field(
+        False,
+        description="If True, appends --allow-unauthenticated to the gcloud command",
+    )
+    confirmed: bool = Field(
+        False,
+        description="Must be True (set by session manager after user confirms) before executing",
+    )
+    reason: str = ""
+
+
+class ConfirmAction(BaseModel):
+    """
+    Request explicit user confirmation before proceeding with a potentially
+    destructive action (e.g. deployment, service stop).
+
+    The session manager intercepts this action, emits ``confirmation_required``
+    to the UI, and pauses the execution loop until the user responds.
+    If the user declines, the loop is aborted.  If confirmed, execution
+    continues with the next action in the plan.
+    """
+    type: Literal[ActionType.CONFIRM] = ActionType.CONFIRM
+    message: str = Field(
+        "Do you want to proceed with this action?",
+        description="Confirmation message shown to the user",
+    )
+    action_ref: str = Field(
+        "",
+        description="Short reference to the action awaiting confirmation (e.g. 'DEPLOY_CLOUD_RUN')",
+    )
+    reason: str = ""
+
+
 class AbortAction(BaseModel):
     type: Literal[ActionType.ABORT] = ActionType.ABORT
     reason: str = ""
@@ -277,6 +360,9 @@ ActionItem = Union[
     ReadFileAction,
     ParseLogAction,
     WriteReportAction,
+    UploadGCSAction,
+    DeployCloudRunAction,
+    ConfirmAction,
     AbortAction,
     HandOffAction,
 ]

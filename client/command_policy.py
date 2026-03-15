@@ -113,7 +113,12 @@ _ALLOWED_RAW: list[tuple[str, str]] = [
     ("python_m_pytest",  r"^\s*python\s+-m\s+pytest\b"),
     # ── Cloud operations ─────────────────────────────────────────────────────
     ("gcloud_run_deploy", r"^\s*gcloud\s+run\s+deploy\b"),
+    ("gcloud_run_services_describe",
+     r"^\s*gcloud\s+run\s+services\s+(describe|list)\b"),
+    ("gcloud_run_services_get_iam",
+     r"^\s*gcloud\s+run\s+services\s+get-iam-policy\b"),
     ("gsutil_cp",         r"^\s*gsutil\s+cp\b"),
+    ("gsutil_ls",         r"^\s*gsutil\s+ls\b"),
     # ── Log inspection ───────────────────────────────────────────────────────
     ("cat_tmp",          r"^\s*cat\s+/tmp/"),
     ("tail_log",         r"^\s*tail\b.*/tmp/"),
