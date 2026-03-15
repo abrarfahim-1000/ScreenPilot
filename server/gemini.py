@@ -7,6 +7,20 @@ Responsibilities:
 - Parse and validate the structured JSON response into a PerceptionOutput
 - Return a safe fallback PerceptionOutput on any error so the orchestrator
   never crashes due to a model failure
+
+CHANGELOG
+---------
+[Fix] _ALLOWED_PLAN_TYPES expanded to include all cloud-integration and
+      terminal action types that the executor already supports. Previously,
+      the planner's allowlist only contained basic UI actions, which meant
+      Gemini could never return EXEC_COMMAND, UPLOAD_GCS, DEPLOY_CLOUD_RUN,
+      CONFIRM, PARSE_LOG, READ_FILE, or WRITE_REPORT — even though the client
+      executor had full implementations for all of them. This was the sole
+      blocker for Step 9 (cloud integration).
+
+      Added types:
+        EXEC_COMMAND, READ_FILE, PARSE_LOG, WRITE_REPORT,
+        UPLOAD_GCS, DEPLOY_CLOUD_RUN, CONFIRM
 """
 
 from __future__ import annotations
@@ -500,12 +514,27 @@ class GeminiPerceptionClient:
         data = json.loads(text)
         return PerceptionOutput.model_validate(data)
 
-    # Allowlisted action types the planner may return.  Any type not in this
-    # set is stripped before the response reaches the client.
+    # ---------------------------------------------------------------------------
+    # [FIX] Planner action type allowlist — expanded for Step 9 cloud integration.
+    #
+    # Previously this set only contained basic UI interaction types, which caused
+    # all cloud-integration actions (EXEC_COMMAND, UPLOAD_GCS, DEPLOY_CLOUD_RUN,
+    # CONFIRM, PARSE_LOG, READ_FILE, WRITE_REPORT) to be silently stripped from
+    # every plan response, even though the client executor had full implementations
+    # for all of them. The allowlist now matches the full set of action types
+    # documented in the planning prompt and supported by the executor.
+    # ---------------------------------------------------------------------------
     _ALLOWED_PLAN_TYPES: frozenset[str] = frozenset({
+        # Basic UI actions (unchanged)
         "FOCUS_WINDOW", "CLICK", "DOUBLE_CLICK", "RIGHT_CLICK",
         "TYPE", "HOTKEY", "SCROLL", "WAIT", "VERIFY",
         "ABORT", "HAND_OFF_TO_USER",
+        # [ADDED] Terminal & file actions (Days 3-5, executor: _exec_command,
+        #         _read_file, _parse_log, _write_report)
+        "EXEC_COMMAND", "READ_FILE", "PARSE_LOG", "WRITE_REPORT",
+        # [ADDED] Cloud integration actions (Days 9-11, executor: _upload_gcs,
+        #         _deploy_cloud_run; session.py: _on_confirmation_required)
+        "UPLOAD_GCS", "DEPLOY_CLOUD_RUN", "CONFIRM",
     })
 
     @classmethod
