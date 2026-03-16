@@ -109,8 +109,11 @@ BLOCKED_PATTERNS: list[tuple[str, re.Pattern]] = [
 _ALLOWED_RAW: list[tuple[str, str]] = [
     # ── Test runners ─────────────────────────────────────────────────────────
     ("make_test",        r"^\s*make\s+test\b"),
+    ("make_test_with_cd", r"^\s*cd\s+.+&&\s*make\s+test\b"),
     ("pytest",           r"^\s*pytest\b"),
     ("python_m_pytest",  r"^\s*python\s+-m\s+pytest\b"),
+    ("make_test_redirect", r"^\s*make\s+test\s+2>&1\s*>"),
+    ("pytest_redirect",    r"^\s*pytest\b.*>\s*\S+"),
     # ── Cloud operations ─────────────────────────────────────────────────────
     ("gcloud_run_deploy", r"^\s*gcloud\s+run\s+deploy\b"),
     ("gcloud_run_services_describe",
@@ -249,6 +252,7 @@ def execute_command(
     command: str,
     timeout_s: int = 60,
     shell: bool = True,
+    cwd: str = None,
 ) -> CommandResult:
     """
     Execute *command* as a subprocess after passing the policy check.
@@ -295,6 +299,7 @@ def execute_command(
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            cwd=cwd,
         )
         returncode = proc.returncode
         stdout = proc.stdout

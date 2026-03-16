@@ -277,11 +277,6 @@ class ControlPanel(QMainWindow):
         self.task_input.setPlaceholderText("e.g. Open Chrome and navigate to github.com")
         setup_layout.addRow(lbl_goal, self.task_input)
 
-        lbl_server = QLabel("Server URL:")
-        lbl_server.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.server_input = QLineEdit("http://localhost:8080")
-        setup_layout.addRow(lbl_server, self.server_input)
-
         # API key row — shown as masked dots if a key is stored
         lbl_key = QLabel("Gemini Key:")
         lbl_key.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -467,7 +462,7 @@ class ControlPanel(QMainWindow):
                 return
 
         task = self.task_input.text().strip()
-        server = self.server_input.text().strip() or "http://localhost:8080"
+        server = "https://ui-navigator-314272999720.asia-southeast1.run.app"
 
         # ── HTTPS guard for non-local servers ─────────────────────────
         _local = ("localhost", "127.0.0.1", "::1")
@@ -644,7 +639,6 @@ class ControlPanel(QMainWindow):
         self.start_btn.setEnabled(not active)
         self.stop_btn.setEnabled(active)
         self.task_input.setEnabled(not active)
-        self.server_input.setEnabled(not active)
         if not active:
             self._update_status("Disconnected", 0)
 

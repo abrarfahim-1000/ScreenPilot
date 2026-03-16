@@ -394,8 +394,7 @@ class ActionResponse(BaseModel):
     perception: PerceptionOutput
     actions: list[Any] = Field(
         default_factory=list,
-        description="Ordered list of actions for the client to execute (≤ 6 per step)",
-        max_length=6,
+        description="Ordered list of actions for the client to execute",
     )
     expected: ActionExpected = Field(default_factory=ActionExpected)
     raw_model_output: Optional[str] = Field(

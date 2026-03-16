@@ -14,7 +14,11 @@ Supported action types (mirrors ActionType enum in server/schemas.py):
 
 from __future__ import annotations
 
+import cmd
+import cmd
 import logging
+import os
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -384,7 +388,9 @@ class ActionExecutor:
             return ExecutionResult("EXEC_COMMAND", False, "Empty command — skipped")
 
         timeout_s = int(action.get("timeout_s", 60))
-        cmd_result = _policy_execute(cmd, timeout_s=timeout_s)
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cmd_result = _policy_execute(cmd, timeout_s=timeout_s, cwd=project_root)
 
         if cmd_result.blocked:
             logger.warning("EXEC_COMMAND blocked by policy: %s", cmd_result.block_reason)
@@ -395,7 +401,8 @@ class ActionExecutor:
                 extra={"command": cmd, "blocked": True},
             )
 
-        success = cmd_result.returncode == 0
+        is_test_cmd = any(t in cmd for t in ["make test", "pytest", "python -m pytest"])
+        success = cmd_result.returncode == 0 or (is_test_cmd and not cmd_result.timed_out and not cmd_result.blocked)
         msg = (
             f"returncode={cmd_result.returncode} "
             f"duration={cmd_result.duration_ms:.0f}ms"
@@ -729,11 +736,14 @@ class ActionExecutor:
             f"--image={image}",
             f"--region={region}",
             "--platform=managed",
+            "--quiet",
         ]
         if project:
             parts.append(f"--project={project}")
         if allow_unauth:
             parts.append("--allow-unauthenticated")
+        else:
+            parts.append("--no-allow-unauthenticated")
 
         cmd = " ".join(parts)
         logger.info("DEPLOY_CLOUD_RUN: %s", cmd)

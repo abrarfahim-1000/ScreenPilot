@@ -1,0 +1,10 @@
+# ── Cloud / server ────────────────────────────────────────────────────────────
+google-genai>=1.65.0          # Gemini via Google GenAI SDK
+google-cloud-storage>=2.16.0  # GCS uploads
+google-cloud-firestore>=2.16.0 # session state + audit logs
+fastapi>=0.111.0              # Cloud Run REST API
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.14      # required by FastAPI for multipart/form-data
+python-dotenv>=1.0.0          # .env file loading
+rapidfuzz>=3.9.0              # optional OCR helper
+requests>=2.31.0              # HTTP client
