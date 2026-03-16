@@ -1,4 +1,4 @@
-# UI Navigator — ScreenPilot
+# ScreenPilot - See it. Plan it. Do it
 
 A cross-application desktop agent that treats your screen as a canvas. Give it a high-level instruction — *"Run my tests, upload the logs, and deploy to Cloud Run"* — and it visually interprets screenshots, plans a sequence of OS-level actions, executes them (click, type, hotkeys), verifies each step by re-observing the screen (**visual precision checks**), and recovers automatically from UI changes or errors (**context-aware visual recovery**).
 
