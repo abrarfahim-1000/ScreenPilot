@@ -9,7 +9,7 @@ Or from repo root:
     python -m client.main
 
 Environment variables (optional):
-    NAVIGATOR_SERVER   Server URL to pre-populate (default: http://localhost:8080)
+    NAVIGATOR_SERVER   Server URL to pre-populate (default: https://ui-navigator-314272999720.asia-southeast1.run.app)
     NAVIGATOR_GOAL     Task goal to pre-populate
     GEMINI_API_KEY     If set, silently seeds the OS keystore so the API-key
                        dialog is skipped on first launch.  The same variable

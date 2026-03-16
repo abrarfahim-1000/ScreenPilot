@@ -6,7 +6,7 @@ PyQt6 UI never blocks.  Emits Qt signals to update the control panel.
 
 Lifecycle
 ---------
-    mgr = SessionManager(server_url="http://localhost:8080", task_goal="...", session_id="abc")
+    mgr = SessionManager(server_url="https://ui-navigator-314272999720.asia-southeast1.run.app", task_goal="...", session_id="abc")
     mgr.action_logged.connect(log_widget.append)
     mgr.status_changed.connect(on_status)
     mgr.frame_ready.connect(on_frame)       # latest JPEG bytes for display
@@ -75,7 +75,7 @@ class SessionManager(QThread):
 
     def __init__(
         self,
-        server_url: str = "http://localhost:8080",
+        server_url: str = "https://ui-navigator-314272999720.asia-southeast1.run.app",
         task_goal: str = "",
         session_id: Optional[str] = None,
         api_key: str = "",
